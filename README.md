@@ -23,6 +23,21 @@ uv run wandb login
 
 We conducted our experiments in the following environment: Python Version 3.12 and CUDA Version 12.2 H100.
 
+### Remote machine setup
+
+On a fresh remote checkout, run:
+
+```bash
+scripts/prepare_remote.sh
+source .remote.env
+uv run huggingface-cli login
+uv run wandb login
+```
+
+The script installs `uv` if needed, creates scratch directories for logs,
+Hugging Face caches, and W&B files, writes `.remote.env`, symlinks `logs` to
+scratch when it can do so safely, and runs `uv sync --frozen`.
+
 ## Training
 
 The model checkpoints are saved in `logs` folder. Each run also writes
