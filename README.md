@@ -25,7 +25,11 @@ We conducted our experiments in the following environment: Python Version 3.12 a
 
 ## Training
 
-The model checkpoints are saved in `logs` folder.
+The model checkpoints are saved in `logs` folder. Each run also writes
+`args.json` and `run_metadata.json` into its run directory with the parsed
+arguments, command, git state, hostname, Python version, and CUDA device
+information. If a run directory already has metadata, later invocations write
+timestamped metadata files instead of overwriting the original files.
 
 **Baseline (ViT):**
 

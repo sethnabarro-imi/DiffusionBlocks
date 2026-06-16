@@ -2,6 +2,11 @@ import os
 import argparse
 import datetime
 import json
+import platform
+import shlex
+import socket
+import subprocess
+import sys
 import torch
 import lightning as L
 from lightning.pytorch.loggers import WandbLogger
@@ -14,6 +19,111 @@ from model import load_model
 torch.set_float32_matmul_precision("high")
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+
+
+def _run_command(command):
+    try:
+        result = subprocess.run(
+            command,
+            cwd=os.path.dirname(__file__),
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+    except OSError:
+        return None
+    value = result.stdout.strip()
+    return value if result.returncode == 0 and value else None
+
+
+def _git_metadata():
+    status = _run_command(["git", "status", "--short"])
+    return {
+        "commit": _run_command(["git", "rev-parse", "HEAD"]),
+        "branch": _run_command(["git", "branch", "--show-current"]),
+        "is_dirty": bool(status),
+        "status_short": status,
+    }
+
+
+def _cuda_metadata():
+    devices = []
+    if torch.cuda.is_available():
+        for idx in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(idx)
+            devices.append(
+                {
+                    "index": idx,
+                    "name": props.name,
+                    "total_memory_gb": round(props.total_memory / 1024**3, 2),
+                    "capability": [props.major, props.minor],
+                }
+            )
+    return {
+        "available": torch.cuda.is_available(),
+        "device_count": torch.cuda.device_count(),
+        "torch_cuda_version": torch.version.cuda,
+        "cudnn_version": torch.backends.cudnn.version(),
+        "devices": devices,
+    }
+
+
+def _environment_metadata():
+    keys = [
+        "CUDA_VISIBLE_DEVICES",
+        "HF_HOME",
+        "HF_DATASETS_CACHE",
+        "LOCAL_RANK",
+        "RANK",
+        "SLURM_ARRAY_TASK_ID",
+        "SLURM_JOB_ID",
+        "WANDB_DIR",
+        "WANDB_MODE",
+        "WORLD_SIZE",
+    ]
+    return {key: os.environ[key] for key in keys if key in os.environ}
+
+
+def _write_json_once(path, data):
+    if os.path.exists(path):
+        stem, ext = os.path.splitext(path)
+        timestamp = datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y%m%dT%H%M%S%fZ"
+        )
+        path = f"{stem}-{timestamp}{ext}"
+    with open(path, "w") as f:
+        json.dump(data, f, default=str, indent=2, sort_keys=True)
+        f.write("\n")
+    return path
+
+
+def write_run_metadata(args, logdir):
+    if int(os.environ.get("LOCAL_RANK", "0")) != 0:
+        return
+    os.makedirs(logdir, exist_ok=True)
+    args_dict = vars(args).copy()
+    metadata = {
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "command": " ".join(
+            shlex.quote(part) for part in [sys.executable, *sys.argv]
+        ),
+        "argv": sys.argv,
+        "executable": sys.executable,
+        "cwd": os.getcwd(),
+        "hostname": socket.gethostname(),
+        "platform": platform.platform(),
+        "python": sys.version,
+        "git": _git_metadata(),
+        "cuda": _cuda_metadata(),
+        "environment": _environment_metadata(),
+        "args": args_dict,
+    }
+    args_path = _write_json_once(os.path.join(logdir, "args.json"), args_dict)
+    metadata_path = _write_json_once(
+        os.path.join(logdir, "run_metadata.json"), metadata
+    )
+    print(f"Wrote run metadata: {metadata_path}")
+    print(f"Wrote args: {args_path}")
 
 
 def main(args):
@@ -34,6 +144,7 @@ def main(args):
             nowname = nowname[1:]
     print("Experiment Name:", nowname)
     logdir = os.path.join("logs", nowname)
+    write_run_metadata(args, logdir)
     logger = WandbLogger(
         project=f"dblocks-{args.data_name}",
         name=nowname,
