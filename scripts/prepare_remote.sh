@@ -83,8 +83,15 @@ LOGS_DIR="$SCRATCH_DIR/logs"
 HF_HOME_DIR="$SCRATCH_DIR/hf-cache"
 HF_DATASETS_DIR="$HF_HOME_DIR/datasets"
 WANDB_DIR="$SCRATCH_DIR/wandb"
+UV_CACHE_DIR="$SCRATCH_DIR/uv-cache"
 
-mkdir -p "$LOGS_DIR" "$HF_DATASETS_DIR" "$WANDB_DIR"
+mkdir -p "$LOGS_DIR" "$HF_DATASETS_DIR" "$WANDB_DIR" "$UV_CACHE_DIR"
+
+export HF_HOME="$HF_HOME_DIR"
+export HF_DATASETS_CACHE="$HF_DATASETS_DIR"
+export WANDB_DIR="$WANDB_DIR"
+export UV_CACHE_DIR="$UV_CACHE_DIR"
+export HF_HUB_ENABLE_HF_TRANSFER=1
 
 ENV_FILE="$PROJECT_DIR/.remote.env"
 {
@@ -94,6 +101,7 @@ ENV_FILE="$PROJECT_DIR/.remote.env"
   printf 'export HF_HOME=%q\n' "$HF_HOME_DIR"
   printf 'export HF_DATASETS_CACHE=%q\n' "$HF_DATASETS_DIR"
   printf 'export WANDB_DIR=%q\n' "$WANDB_DIR"
+  printf 'export UV_CACHE_DIR=%q\n' "$UV_CACHE_DIR"
   printf 'export HF_HUB_ENABLE_HF_TRANSFER=1\n'
 } > "$ENV_FILE"
 
@@ -112,7 +120,26 @@ if [[ "$LINK_LOGS" -eq 1 ]]; then
 fi
 
 if [[ "$RUN_SYNC" -eq 1 ]]; then
-  uv sync --frozen
+  if ! uv sync --frozen; then
+    cat >&2 <<'EOF'
+
+uv sync failed.
+
+If the failure mentions flash-attn, first make sure this checkout includes:
+
+  [tool.uv.extra-build-dependencies]
+  flash-attn = ["torch==2.6.0"]
+
+Then retry:
+
+  bash scripts/prepare_remote.sh
+
+If flash-attn gets past metadata generation but fails compiling CUDA code, the
+machine likely needs a CUDA toolkit with nvcc that matches the PyTorch CUDA
+runtime closely enough for flash-attn.
+EOF
+    exit 1
+  fi
 fi
 
 cat <<EOF
@@ -124,6 +151,7 @@ Scratch:      $SCRATCH_DIR
 Logs:         $LOGS_DIR
 HF cache:     $HF_HOME_DIR
 W&B dir:      $WANDB_DIR
+uv cache:     $UV_CACHE_DIR
 Environment: $ENV_FILE
 
 Next:

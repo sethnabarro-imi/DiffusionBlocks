@@ -30,3 +30,6 @@ torch = [
 torchvision = [
     { index = "pytorch-cu124", marker = "sys_platform == 'linux'"}
 ]
+
+[tool.uv.extra-build-dependencies]
+flash-attn = ["torch==2.6.0"]
