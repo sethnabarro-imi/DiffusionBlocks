@@ -97,6 +97,38 @@ def _write_json_once(path, data):
     return path
 
 
+def _checkpoint_hyperparameters(ckpt_path):
+    if ckpt_path is None or not os.path.exists(ckpt_path):
+        return {}
+    checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    return checkpoint.get("hyper_parameters", {})
+
+
+def _get_hyperparameter(hparams, key):
+    if key in hparams:
+        return hparams[key]
+    args = hparams.get("args")
+    if isinstance(args, dict):
+        return args.get(key)
+    if hasattr(args, key):
+        return getattr(args, key)
+    return None
+
+
+def apply_checkpoint_defaults(args):
+    if args.ckpt_path is None:
+        return
+    if args.model_type != "dblock":
+        return
+    if args.epsilon_seed is not None:
+        return
+    hparams = _checkpoint_hyperparameters(args.ckpt_path)
+    epsilon_seed = _get_hyperparameter(hparams, "epsilon_seed")
+    if epsilon_seed is not None:
+        args.epsilon_seed = int(epsilon_seed)
+        print(f"Loaded epsilon_seed from checkpoint: {args.epsilon_seed}")
+
+
 def write_run_metadata(args, logdir):
     if int(os.environ.get("LOCAL_RANK", "0")) != 0:
         return
@@ -137,6 +169,7 @@ def write_eval_results(args, data, logdir, ckpt_path, split_results):
         "ckpt_path": ckpt_path,
         "ece_num_bins": args.ece_num_bins,
         "input_noise_std": args.input_noise_std,
+        "epsilon_seed": args.epsilon_seed,
         "num_prediction_samples": args.num_prediction_samples,
         "prediction_average": args.prediction_average,
         "splits": {},
@@ -177,6 +210,7 @@ def main(args):
     data = load_data(args)
     args.image_size = data.image_size
     args.num_labels = data.num_labels
+    apply_checkpoint_defaults(args)
     model = load_model(args)
     if args.ckpt_path is not None:
         nowname = os.path.basename(os.path.dirname(args.ckpt_path))
@@ -290,5 +324,11 @@ if __name__ == "__main__":
     )
     parser.add_argument("--cfg_scale", type=float, default=0.0)
     parser.add_argument("--class_dropout_prob", type=float, default=0.0)
+    parser.add_argument(
+        "--epsilon_seed",
+        type=int,
+        default=None,
+        help="if set, reset epsilon sampling to this seed for every dblock noise draw",
+    )
     args = parser.parse_args()
     main(args)

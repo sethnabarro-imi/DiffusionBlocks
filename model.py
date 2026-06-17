@@ -292,6 +292,9 @@ class ViTDBlockModel(ViTModel):
         self.num_prediction_samples = self.args.num_prediction_samples
         self.prediction_average = self.args.prediction_average
         self.num_inference_steps = self.args.num_inference_steps or self.args.num_blocks
+        self.epsilon_seed = self.args.epsilon_seed
+        if self.epsilon_seed is not None and self.epsilon_seed < 0:
+            raise ValueError("--epsilon_seed must be non-negative")
         self.block_sigmas = get_block_sigmas(num_layers=self.args.num_blocks)
         self.layer_assignment = None
         self.register_buffer(
@@ -308,6 +311,7 @@ class ViTDBlockModel(ViTModel):
                 "prediction_average": self.prediction_average,
                 "cfg_scale": self.cfg_scale,
                 "class_dropout_prob": self.class_dropout_prob,
+                "epsilon_seed": self.epsilon_seed,
             },
         )
 
@@ -355,6 +359,35 @@ class ViTDBlockModel(ViTModel):
 
     def get_weights(self, sigmas):
         return (sigmas**2 + self.sigma_data**2) / (sigmas * self.sigma_data) ** 2
+
+    def sample_epsilon_like(self, reference: torch.Tensor) -> torch.Tensor:
+        if self.epsilon_seed is None:
+            return torch.randn_like(reference)
+        generator = torch.Generator(device="cpu").manual_seed(self.epsilon_seed)
+        epsilon = torch.randn(
+            reference.shape,
+            generator=generator,
+            device="cpu",
+            dtype=torch.float32,
+        )
+        return epsilon.to(device=reference.device, dtype=reference.dtype)
+
+    def sample_epsilon(
+        self,
+        shape: tuple[int, ...],
+        device: torch.device,
+        dtype: torch.dtype = torch.float32,
+    ) -> torch.Tensor:
+        if self.epsilon_seed is None:
+            return torch.randn(shape, device=device, dtype=dtype)
+        generator = torch.Generator(device="cpu").manual_seed(self.epsilon_seed)
+        epsilon = torch.randn(
+            shape,
+            generator=generator,
+            device="cpu",
+            dtype=torch.float32,
+        )
+        return epsilon.to(device=device, dtype=dtype)
 
     def estimate_target_layer(self, sigma: torch.Tensor) -> int:
         block_sigmas = torch.tensor(self.block_sigmas, device=sigma.device)
@@ -426,7 +459,7 @@ class ViTDBlockModel(ViTModel):
         sigmas = self.get_sigmas(z.shape[0])
         block_idx = self.estimate_target_layer(sigmas)
         sigmas = sigmas.to(z)
-        zt = z + sigmas[:, None] * torch.randn_like(z)
+        zt = z + sigmas[:, None] * self.sample_epsilon_like(z)
         logits = self.denoise(pixel_values, zt, sigmas, block_idx)
         loss = F.cross_entropy(
             logits.view(-1, self.num_labels), labels.view(-1), reduction="none"
@@ -466,7 +499,7 @@ class ViTDBlockModel(ViTModel):
     def diffusion_sample(self, x):
         bsz = x.shape[0]
         hidden_size = self.model.config.hidden_size
-        z = torch.randn(bsz, hidden_size, device=x.device)
+        z = self.sample_epsilon((bsz, hidden_size), device=x.device)
         z *= torch.sqrt(1.0 + self.sigmas[0] ** 2.0)
         s_in = x.new_ones([x.shape[0]])
         for i in range(self.sigmas.shape[0] - 1):
