@@ -216,3 +216,6 @@ __marimo__/
 sbatch.sh
 .slurm_cache/
 test.ipynb
+
+results/**
+tmp/**

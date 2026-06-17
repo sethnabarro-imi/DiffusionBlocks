@@ -287,6 +287,9 @@ class ViTDBlockModel(ViTModel):
         self.class_dropout_prob = (
             args.class_dropout_prob if self.cfg_scale > 0.0 else 0.0
         )
+        if self.args.num_prediction_samples < 1:
+            raise ValueError("--num_prediction_samples must be at least 1")
+        self.num_prediction_samples = self.args.num_prediction_samples
         self.num_inference_steps = self.args.num_inference_steps or self.args.num_blocks
         self.block_sigmas = get_block_sigmas(num_layers=self.args.num_blocks)
         self.layer_assignment = None
@@ -300,6 +303,7 @@ class ViTDBlockModel(ViTModel):
             {
                 "gamma": self.gamma,
                 "num_inference_steps": self.num_inference_steps,
+                "num_prediction_samples": self.num_prediction_samples,
                 "cfg_scale": self.cfg_scale,
                 "class_dropout_prob": self.class_dropout_prob,
             },
@@ -438,9 +442,20 @@ class ViTDBlockModel(ViTModel):
         return loss, loss_dict
 
     def diffusion_step(self, x):
+        probs = None
+        for _ in range(self.num_prediction_samples):
+            logits = self.diffusion_sample(x)
+            sample_probs = F.softmax(logits.float(), dim=1)
+            probs = sample_probs if probs is None else probs + sample_probs
+        probs = probs / self.num_prediction_samples
+        # Downstream metrics expect logits; log averaged probabilities preserves
+        # the requested probability average because softmax(log p) = p.
+        return probs.clamp_min(torch.finfo(probs.dtype).tiny).log()
+
+    def diffusion_sample(self, x):
         bsz = x.shape[0]
         hidden_size = self.model.config.hidden_size
-        z = torch.randn(bsz, hidden_size, device=self.device)
+        z = torch.randn(bsz, hidden_size, device=x.device)
         z *= torch.sqrt(1.0 + self.sigmas[0] ** 2.0)
         s_in = x.new_ones([x.shape[0]])
         for i in range(self.sigmas.shape[0] - 1):
@@ -457,6 +472,6 @@ class ViTDBlockModel(ViTModel):
             euler_step = z + dt[:, None] * d
             z = euler_step
         min_sigma = self.sigmas[-1].item()
-        sigmas = torch.full((x.shape[0],), min_sigma, device=self.device)
+        sigmas = torch.full((x.shape[0],), min_sigma, device=x.device)
         logits = self.denoise(x, z, sigmas)
         return logits
