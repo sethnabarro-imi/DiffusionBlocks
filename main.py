@@ -126,6 +126,16 @@ def write_run_metadata(args, logdir):
     print(f"Wrote args: {args_path}")
 
 
+def run_train_test_evaluation(trainer, model, data, ckpt_path):
+    data.setup("test")
+    if "train_eval" in data.datasets:
+        model.eval_split = "train_eval"
+        trainer.test(model, data.train_eval_dataloader(), ckpt_path=ckpt_path)
+    if data.test_key is not None:
+        model.eval_split = "test"
+        trainer.test(model, data.test_dataloader(), ckpt_path=ckpt_path)
+
+
 def main(args):
     L.seed_everything(args.seed)
 
@@ -185,11 +195,10 @@ def main(args):
     )
     if args.stage == "train":
         trainer.fit(model, data, ckpt_path=args.ckpt_path)
-        if data.test_key is not None:
-            trainer.test(model, data.test_dataloader(), ckpt_path="best")
+        run_train_test_evaluation(trainer, model, data, ckpt_path="best")
     else:
         assert args.ckpt_path is not None
-        trainer.test(model, data, ckpt_path=args.ckpt_path)
+        run_train_test_evaluation(trainer, model, data, ckpt_path=args.ckpt_path)
 
 
 if __name__ == "__main__":
@@ -204,6 +213,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--add_rand_aug", action="store_true")
     parser.add_argument("--eval_batch_size", type=int, default=None)
+    parser.add_argument("--ece_num_bins", type=int, default=15)
     parser.add_argument("--save_every_n_epochs", type=int, default=5)
     parser.add_argument("--accumulate_grad_batches", type=int, default=1)
     parser.add_argument("--gradient_checkpointing", action="store_true")

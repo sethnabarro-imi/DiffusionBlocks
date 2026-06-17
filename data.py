@@ -72,7 +72,12 @@ class ImageDataModule(L.LightningDataModule):
         train_data = data[self.train_key].with_transform(
             partial(transforms, transform=self.train_transforms)
         )
+        train_eval_data = data[self.train_key].with_transform(
+            partial(transforms, transform=self.val_transforms)
+        )
         self.datasets["train"] = train_data
+        self.datasets["train_eval"] = train_eval_data
+        self.train_eval_dataloader = self._train_eval_dataloader
         if self.val_key is not None:
             val_data = data[self.val_key].with_transform(
                 partial(transforms, transform=self.val_transforms)
@@ -96,13 +101,23 @@ class ImageDataModule(L.LightningDataModule):
             shuffle=True,
         )
 
+    def _train_eval_dataloader(self):
+        return DataLoader(
+            self.datasets["train_eval"],
+            batch_size=self.eval_batch_size,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            drop_last=False,
+            shuffle=False,
+        )
+
     def _val_dataloader(self):
         return DataLoader(
             self.datasets["val"],
             batch_size=self.eval_batch_size,
             num_workers=self.num_workers,
             pin_memory=True,
-            drop_last=True,
+            drop_last=False,
             shuffle=False,
         )
 
@@ -112,7 +127,7 @@ class ImageDataModule(L.LightningDataModule):
             batch_size=self.eval_batch_size,
             num_workers=self.num_workers,
             pin_memory=True,
-            drop_last=True,
+            drop_last=False,
             shuffle=False,
         )
 

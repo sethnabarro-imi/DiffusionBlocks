@@ -11,6 +11,82 @@ from vit import load_vit
 from dblock_modules import get_block_sigmas, get_discrete_sigmas
 
 
+class ExpectedCalibrationError(torchmetrics.Metric):
+    higher_is_better = False
+    full_state_update = False
+
+    def __init__(self, num_bins: int = 15):
+        super().__init__()
+        self.num_bins = num_bins
+        self.add_state(
+            "confidence_sum",
+            default=torch.zeros(num_bins),
+            dist_reduce_fx="sum",
+        )
+        self.add_state(
+            "correct_sum",
+            default=torch.zeros(num_bins),
+            dist_reduce_fx="sum",
+        )
+        self.add_state(
+            "count",
+            default=torch.zeros(num_bins),
+            dist_reduce_fx="sum",
+        )
+
+    def update(self, logits: torch.Tensor, labels: torch.Tensor) -> None:
+        probs = F.softmax(logits.float(), dim=-1)
+        confidences, predictions = probs.max(dim=-1)
+        labels = labels.view(-1)
+        confidences = confidences.view(-1)
+        predictions = predictions.view(-1)
+        correct = predictions.eq(labels).float()
+
+        bin_indices = torch.clamp(
+            (confidences * self.num_bins).long(),
+            min=0,
+            max=self.num_bins - 1,
+        )
+        self.confidence_sum.scatter_add_(0, bin_indices, confidences)
+        self.correct_sum.scatter_add_(0, bin_indices, correct)
+        self.count.scatter_add_(0, bin_indices, torch.ones_like(confidences))
+
+    def compute(self) -> torch.Tensor:
+        non_empty = self.count > 0
+        safe_count = self.count.clamp_min(1)
+        accuracy = self.correct_sum / safe_count
+        confidence = self.confidence_sum / safe_count
+        weights = self.count / self.count.sum().clamp_min(1)
+        return (
+            weights[non_empty]
+            * (accuracy[non_empty] - confidence[non_empty]).abs()
+        ).sum()
+
+
+class MulticlassLogLikelihood(torchmetrics.Metric):
+    higher_is_better = True
+    full_state_update = False
+
+    def __init__(self):
+        super().__init__()
+        self.add_state(
+            "log_likelihood_sum",
+            default=torch.tensor(0.0),
+            dist_reduce_fx="sum",
+        )
+        self.add_state("count", default=torch.tensor(0.0), dist_reduce_fx="sum")
+
+    def update(self, logits: torch.Tensor, labels: torch.Tensor) -> None:
+        log_probs = F.log_softmax(logits.float(), dim=-1)
+        labels = labels.view(-1)
+        log_likelihoods = log_probs.gather(1, labels[:, None]).squeeze(1)
+        self.log_likelihood_sum += log_likelihoods.sum()
+        self.count += labels.numel()
+
+    def compute(self) -> torch.Tensor:
+        return self.log_likelihood_sum / self.count.clamp_min(1)
+
+
 def load_model(args):
     if args.model_type == "vit":
         return ViTModel(args)
@@ -26,7 +102,14 @@ class ViTModel(L.LightningModule):
         self.args = args
         self.image_size = args.image_size
         self.num_labels = args.num_labels
-        self.valid_metrics = torchmetrics.MetricCollection(
+        self.valid_metrics = self.build_eval_metrics("val/")
+        self.train_eval_metrics = self.build_eval_metrics("train_eval/")
+        self.test_metrics = self.build_eval_metrics("test/")
+        self.eval_split = "test"
+        self.save_hyperparameters(args)
+
+    def build_eval_metrics(self, prefix: str):
+        return torchmetrics.MetricCollection(
             {
                 "acc": torchmetrics.Accuracy(
                     task="multiclass", num_classes=self.num_labels
@@ -34,11 +117,11 @@ class ViTModel(L.LightningModule):
                 "f1": torchmetrics.F1Score(
                     task="multiclass", num_classes=self.num_labels
                 ),
+                "ece": ExpectedCalibrationError(num_bins=self.args.ece_num_bins),
+                "log_likelihood": MulticlassLogLikelihood(),
             },
-            prefix="val/",
+            prefix=prefix,
         )
-        self.test_metrics = self.valid_metrics.clone(prefix="test/")
-        self.save_hyperparameters(args)
 
     def configure_model(self):
         self.model = load_vit(image_size=self.image_size, num_labels=self.num_labels)
@@ -69,14 +152,14 @@ class ViTModel(L.LightningModule):
         labels = batch["labels"]
         logits = self(pixel_values=pixel_values, **kwargs)
         if return_metrics:
+            logits = logits.view(-1, self.num_labels)
+            labels = labels.view(-1)
             if step == "val":
-                return self.valid_metrics(
-                    logits.view(-1, self.num_labels), labels.view(-1)
-                )
+                return self.valid_metrics(logits, labels)
+            elif step == "train_eval":
+                return self.train_eval_metrics(logits, labels)
             elif step == "test":
-                return self.test_metrics(
-                    logits.view(-1, self.num_labels), labels.view(-1)
-                )
+                return self.test_metrics(logits, labels)
             else:
                 raise NotImplementedError(f"Step {step} is not supported")
 
@@ -103,7 +186,9 @@ class ViTModel(L.LightningModule):
     def test_step(self, batch, batch_idx):
         batch_size = batch["pixel_values"].shape[0]
         model_kwargs = self.get_model_kwargs(batch)
-        res = self.shared_step(batch, step="test", return_metrics=True, **model_kwargs)
+        res = self.shared_step(
+            batch, step=self.eval_split, return_metrics=True, **model_kwargs
+        )
         self.log_dict(res, batch_size=batch_size, prog_bar=True)
 
 
@@ -234,14 +319,14 @@ class ViTDBlockModel(ViTModel):
 
         if return_metrics:
             logits = self.diffusion_step(pixel_values)
+            logits = logits.view(-1, self.num_labels)
+            labels = labels.view(-1)
             if step == "val":
-                return self.valid_metrics(
-                    logits.view(-1, self.num_labels), labels.view(-1)
-                )
+                return self.valid_metrics(logits, labels)
+            elif step == "train_eval":
+                return self.train_eval_metrics(logits, labels)
             elif step == "test":
-                return self.test_metrics(
-                    logits.view(-1, self.num_labels), labels.view(-1)
-                )
+                return self.test_metrics(logits, labels)
             else:
                 raise NotImplementedError(f"Step {step} is not supported")
 
