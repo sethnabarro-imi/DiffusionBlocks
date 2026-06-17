@@ -290,6 +290,7 @@ class ViTDBlockModel(ViTModel):
         if self.args.num_prediction_samples < 1:
             raise ValueError("--num_prediction_samples must be at least 1")
         self.num_prediction_samples = self.args.num_prediction_samples
+        self.prediction_average = self.args.prediction_average
         self.num_inference_steps = self.args.num_inference_steps or self.args.num_blocks
         self.block_sigmas = get_block_sigmas(num_layers=self.args.num_blocks)
         self.layer_assignment = None
@@ -304,6 +305,7 @@ class ViTDBlockModel(ViTModel):
                 "gamma": self.gamma,
                 "num_inference_steps": self.num_inference_steps,
                 "num_prediction_samples": self.num_prediction_samples,
+                "prediction_average": self.prediction_average,
                 "cfg_scale": self.cfg_scale,
                 "class_dropout_prob": self.class_dropout_prob,
             },
@@ -442,15 +444,24 @@ class ViTDBlockModel(ViTModel):
         return loss, loss_dict
 
     def diffusion_step(self, x):
-        probs = None
+        outputs = None
         for _ in range(self.num_prediction_samples):
             logits = self.diffusion_sample(x)
-            sample_probs = F.softmax(logits.float(), dim=1)
-            probs = sample_probs if probs is None else probs + sample_probs
-        probs = probs / self.num_prediction_samples
-        # Downstream metrics expect logits; log averaged probabilities preserves
-        # the requested probability average because softmax(log p) = p.
-        return probs.clamp_min(torch.finfo(probs.dtype).tiny).log()
+            if self.prediction_average == "probability":
+                sample_output = F.softmax(logits.float(), dim=1)
+            elif self.prediction_average == "logit":
+                sample_output = logits.float()
+            else:
+                raise ValueError(
+                    f"Unsupported prediction_average: {self.prediction_average}"
+                )
+            outputs = sample_output if outputs is None else outputs + sample_output
+        outputs = outputs / self.num_prediction_samples
+        if self.prediction_average == "probability":
+            # Downstream metrics expect logits; log averaged probabilities preserves
+            # the requested probability average because softmax(log p) = p.
+            return outputs.clamp_min(torch.finfo(outputs.dtype).tiny).log()
+        return outputs
 
     def diffusion_sample(self, x):
         bsz = x.shape[0]

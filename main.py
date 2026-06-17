@@ -137,6 +137,7 @@ def write_eval_results(args, data, logdir, ckpt_path, split_results):
         "ckpt_path": ckpt_path,
         "ece_num_bins": args.ece_num_bins,
         "num_prediction_samples": args.num_prediction_samples,
+        "prediction_average": args.prediction_average,
         "splits": {},
     }
     for split, metrics in split_results.items():
@@ -279,6 +280,12 @@ if __name__ == "__main__":
     parser.add_argument("--gamma", type=float, default=0.05)
     parser.add_argument("--num_inference_steps", type=int, default=None)
     parser.add_argument("--num_prediction_samples", type=int, default=1)
+    parser.add_argument(
+        "--prediction_average",
+        type=str,
+        default="probability",
+        choices=["probability", "logit"],
+    )
     parser.add_argument("--cfg_scale", type=float, default=0.0)
     parser.add_argument("--class_dropout_prob", type=float, default=0.0)
     args = parser.parse_args()
