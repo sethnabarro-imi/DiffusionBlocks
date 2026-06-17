@@ -126,7 +126,32 @@ def write_run_metadata(args, logdir):
     print(f"Wrote args: {args_path}")
 
 
-def run_train_test_evaluation(trainer, model, data, ckpt_path):
+def write_eval_results(args, data, logdir, ckpt_path, split_results):
+    if int(os.environ.get("LOCAL_RANK", "0")) != 0:
+        return
+    payload = {
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "dataset_name": args.data_name,
+        "dataset_source": data.data_name,
+        "model_type": args.model_type,
+        "ckpt_path": ckpt_path,
+        "ece_num_bins": args.ece_num_bins,
+        "splits": {},
+    }
+    for split, metrics in split_results.items():
+        payload["splits"][split] = {
+            "accuracy": metrics.get("acc"),
+            "f1": metrics.get("f1"),
+            "ece": metrics.get("ece"),
+            "log_likelihood": metrics.get("log_likelihood"),
+            "ece_bins": metrics.get("ece_bins", []),
+        }
+    path = _write_json_once(os.path.join(logdir, "eval_results.json"), payload)
+    print(f"Wrote eval results: {path}")
+
+
+def run_train_test_evaluation(trainer, model, data, ckpt_path, args, logdir):
+    model.eval_results_by_split = {}
     data.setup("test")
     if "train_eval" in data.datasets:
         model.eval_split = "train_eval"
@@ -134,6 +159,13 @@ def run_train_test_evaluation(trainer, model, data, ckpt_path):
     if data.test_key is not None:
         model.eval_split = "test"
         trainer.test(model, data.test_dataloader(), ckpt_path=ckpt_path)
+    write_eval_results(
+        args,
+        data,
+        logdir,
+        ckpt_path,
+        model.eval_results_by_split,
+    )
 
 
 def main(args):
@@ -195,10 +227,14 @@ def main(args):
     )
     if args.stage == "train":
         trainer.fit(model, data, ckpt_path=args.ckpt_path)
-        run_train_test_evaluation(trainer, model, data, ckpt_path="best")
+        run_train_test_evaluation(
+            trainer, model, data, ckpt_path="best", args=args, logdir=logdir
+        )
     else:
         assert args.ckpt_path is not None
-        run_train_test_evaluation(trainer, model, data, ckpt_path=args.ckpt_path)
+        run_train_test_evaluation(
+            trainer, model, data, ckpt_path=args.ckpt_path, args=args, logdir=logdir
+        )
 
 
 if __name__ == "__main__":

@@ -62,6 +62,29 @@ class ExpectedCalibrationError(torchmetrics.Metric):
             * (accuracy[non_empty] - confidence[non_empty]).abs()
         ).sum()
 
+    def calibration_stats(self) -> dict[str, torch.Tensor]:
+        safe_count = self.count.clamp_min(1)
+        accuracy = self.correct_sum / safe_count
+        confidence = self.confidence_sum / safe_count
+        total = self.count.sum().clamp_min(1)
+        edges = torch.linspace(
+            0.0,
+            1.0,
+            self.num_bins + 1,
+            device=self.count.device,
+            dtype=self.count.dtype,
+        )
+        return {
+            "bin_lower": edges[:-1],
+            "bin_upper": edges[1:],
+            "bin_center": (edges[:-1] + edges[1:]) / 2,
+            "count": self.count,
+            "frequency": self.count / total,
+            "accuracy": accuracy,
+            "confidence": confidence,
+            "gap": (accuracy - confidence).abs(),
+        }
+
 
 class MulticlassLogLikelihood(torchmetrics.Metric):
     higher_is_better = True
@@ -106,6 +129,7 @@ class ViTModel(L.LightningModule):
         self.train_eval_metrics = self.build_eval_metrics("train_eval/")
         self.test_metrics = self.build_eval_metrics("test/")
         self.eval_split = "test"
+        self.eval_results_by_split = {}
         self.save_hyperparameters(args)
 
     def build_eval_metrics(self, prefix: str):
@@ -190,6 +214,68 @@ class ViTModel(L.LightningModule):
             batch, step=self.eval_split, return_metrics=True, **model_kwargs
         )
         self.log_dict(res, batch_size=batch_size, prog_bar=True)
+
+    def on_test_epoch_start(self):
+        self.get_eval_metrics(self.eval_split).reset()
+
+    def on_test_epoch_end(self):
+        metrics = self.get_eval_metrics(self.eval_split)
+        split_results = {}
+        for metric_name, metric in metrics.items():
+            with metric.sync_context():
+                value = metric.compute().detach().float().cpu().item()
+            split_results[self.strip_metric_prefix(metric_name)] = value
+
+        calibration_metric = self.get_calibration_metric(self.eval_split)
+        with calibration_metric.sync_context():
+            stats = calibration_metric.calibration_stats()
+            split_results["ece_bins"] = self.calibration_rows(stats)
+
+        if self.trainer.is_global_zero:
+            self.eval_results_by_split[self.eval_split] = split_results
+
+    def get_eval_metrics(self, split: str):
+        if split == "train_eval":
+            return self.train_eval_metrics
+        if split == "test":
+            return self.test_metrics
+        if split == "val":
+            return self.valid_metrics
+        raise NotImplementedError(f"Step {split} is not supported")
+
+    def get_calibration_metric(self, split: str) -> ExpectedCalibrationError:
+        for metric in self.get_eval_metrics(split).values():
+            if isinstance(metric, ExpectedCalibrationError):
+                return metric
+        raise RuntimeError(f"No calibration metric configured for {split}")
+
+    def strip_metric_prefix(self, metric_name: str) -> str:
+        prefix = f"{self.eval_split}/"
+        if metric_name.startswith(prefix):
+            return metric_name[len(prefix) :]
+        return metric_name
+
+    def calibration_rows(self, stats: dict[str, torch.Tensor]) -> list[dict]:
+        cpu_stats = {
+            key: value.detach().float().cpu().tolist()
+            for key, value in stats.items()
+        }
+        rows = []
+        for idx in range(len(cpu_stats["count"])):
+            rows.append(
+                {
+                    "bin_index": idx,
+                    "bin_lower": cpu_stats["bin_lower"][idx],
+                    "bin_upper": cpu_stats["bin_upper"][idx],
+                    "bin_center": cpu_stats["bin_center"][idx],
+                    "count": int(cpu_stats["count"][idx]),
+                    "frequency": cpu_stats["frequency"][idx],
+                    "accuracy_rate": cpu_stats["accuracy"][idx],
+                    "confidence_rate": cpu_stats["confidence"][idx],
+                    "gap": cpu_stats["gap"][idx],
+                }
+            )
+        return rows
 
 
 class ViTDBlockModel(ViTModel):
