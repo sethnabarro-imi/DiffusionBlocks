@@ -1,6 +1,7 @@
 import os
 from functools import partial
 
+import torch
 from torch.utils.data import DataLoader
 from torchvision import transforms as T
 import lightning as L
@@ -18,6 +19,10 @@ def transforms(examples, transform):
     }
 
 
+def add_gaussian_noise(x, std: float):
+    return x + std * torch.randn_like(x)
+
+
 class ImageDataModule(L.LightningDataModule):
     data_name = None
     image_size = None
@@ -31,11 +36,15 @@ class ImageDataModule(L.LightningDataModule):
         eval_batch_size: int | None = None,
         num_workers: int | None = None,
         add_rand_aug: bool = False,
+        input_noise_std: float = 0.0,
     ):
         super().__init__()
+        if input_noise_std < 0.0:
+            raise ValueError("--input_noise_std must be non-negative")
         self.batch_size = batch_size
         self.eval_batch_size = eval_batch_size or batch_size
         self.num_workers = num_workers if num_workers is not None else os.cpu_count()
+        self.input_noise_std = input_noise_std
         self.collate_fn = None
         train_transforms = [
             T.Lambda(lambda x: x.convert("RGB")),
@@ -49,10 +58,7 @@ class ImageDataModule(L.LightningDataModule):
             T.Resize(self.image_size),
             T.CenterCrop(self.image_size),
         ]
-        post_transforms = [
-            T.ToTensor(),
-            T.Normalize(mean=self.mean, std=self.std),
-        ]
+        post_transforms = self.post_transforms()
         self.train_transforms = T.Compose(train_transforms + post_transforms)
         self.val_transforms = T.Compose(val_transformers + post_transforms)
         self.datasets = {}
@@ -62,6 +68,17 @@ class ImageDataModule(L.LightningDataModule):
 
     def prepare_data(self):
         load_dataset(self.data_name, num_proc=os.cpu_count() // 2)
+
+    def post_transforms(self):
+        post_transforms = [T.ToTensor()]
+        if self.input_noise_std > 0.0:
+            post_transforms.append(
+                T.Lambda(
+                    partial(add_gaussian_noise, std=self.input_noise_std)
+                )
+            )
+        post_transforms.append(T.Normalize(mean=self.mean, std=self.std))
+        return post_transforms
 
     def setup_dataset(self, data: DatasetDict):
         return data
@@ -158,10 +175,7 @@ class CIFAR100DataModule(ImageDataModule):
             T.Resize([self.image_size, self.image_size]),
             T.CenterCrop(self.image_size),
         ]
-        post_transforms = [
-            T.ToTensor(),
-            T.Normalize(mean=self.mean, std=self.std),
-        ]
+        post_transforms = self.post_transforms()
         self.train_transforms = T.Compose(train_transforms + post_transforms)
         self.val_transforms = T.Compose(val_transforms + post_transforms)
 
@@ -195,10 +209,7 @@ class TinyImageNetDataModule(ImageDataModule):
             T.Resize(self.image_size),
             T.CenterCrop(self.image_size),
         ]
-        post_transforms = [
-            T.ToTensor(),
-            T.Normalize(mean=self.mean, std=self.std),
-        ]
+        post_transforms = self.post_transforms()
         self.train_transforms = T.Compose(train_transforms + post_transforms)
         self.val_transforms = T.Compose(val_transforms + post_transforms)
 
@@ -209,6 +220,7 @@ def load_data(args):
         "eval_batch_size": args.eval_batch_size,
         "num_workers": args.num_workers,
         "add_rand_aug": args.add_rand_aug,
+        "input_noise_std": args.input_noise_std,
     }
     if args.data_name == "cifar100":
         return CIFAR100DataModule(**data_kwargs)

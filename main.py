@@ -136,6 +136,7 @@ def write_eval_results(args, data, logdir, ckpt_path, split_results):
         "model_type": args.model_type,
         "ckpt_path": ckpt_path,
         "ece_num_bins": args.ece_num_bins,
+        "input_noise_std": args.input_noise_std,
         "num_prediction_samples": args.num_prediction_samples,
         "prediction_average": args.prediction_average,
         "splits": {},
@@ -250,6 +251,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_epochs", type=int, default=500)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--add_rand_aug", action="store_true")
+    parser.add_argument("--input_noise_std", type=float, default=0.0)
     parser.add_argument("--eval_batch_size", type=int, default=None)
     parser.add_argument("--ece_num_bins", type=int, default=15)
     parser.add_argument("--save_every_n_epochs", type=int, default=5)
