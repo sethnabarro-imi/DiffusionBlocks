@@ -215,7 +215,17 @@ def run_train_test_evaluation(trainer, model, data, ckpt_path, args, logdir):
     )
 
 
+def validate_args(args):
+    if args.num_hidden_layers < 1:
+        raise ValueError("--num_hidden_layers must be at least 1")
+    for key in ["attention_probs_dropout_prob", "hidden_dropout_prob"]:
+        value = getattr(args, key)
+        if value < 0.0 or value > 1.0:
+            raise ValueError(f"--{key} must be between 0 and 1")
+
+
 def main(args):
+    validate_args(args)
     L.seed_everything(args.seed)
 
     data = load_data(args)
@@ -297,6 +307,24 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--add_rand_aug", action="store_true")
     parser.add_argument("--input_noise_std", type=float, default=0.0)
+    parser.add_argument(
+        "--num_hidden_layers",
+        type=int,
+        default=12,
+        help="number of transformer layers in the ViT backbone",
+    )
+    parser.add_argument(
+        "--attention_probs_dropout_prob",
+        type=float,
+        default=0.1,
+        help="dropout probability applied to attention probabilities",
+    )
+    parser.add_argument(
+        "--hidden_dropout_prob",
+        type=float,
+        default=0.1,
+        help="dropout probability applied to hidden states",
+    )
     parser.add_argument("--eval_batch_size", type=int, default=None)
     parser.add_argument("--ece_num_bins", type=int, default=15)
     parser.add_argument("--save_every_n_epochs", type=int, default=5)

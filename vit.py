@@ -823,20 +823,20 @@ class ViTDiTForImageClassification(ViTPreTrainedModel):
 def load_vit(image_size: int, num_labels: int, is_dblock: bool = False, **kwargs):
     if image_size == 32:
         # CIFAR
-        kwargs["patch_size"] = 4
-        kwargs["num_hidden_layers"] = 12
-        kwargs["hidden_size"] = 128
-        kwargs["num_attention_heads"] = 4
-        kwargs["attention_probs_dropout_prob"] = 0.1
-        kwargs["hidden_dropout_prob"] = 0.1
+        kwargs.setdefault("patch_size", 4)
+        kwargs.setdefault("num_hidden_layers", 12)
+        kwargs.setdefault("hidden_size", 128)
+        kwargs.setdefault("num_attention_heads", 4)
+        kwargs.setdefault("attention_probs_dropout_prob", 0.1)
+        kwargs.setdefault("hidden_dropout_prob", 0.1)
     elif image_size == 64:
         # Tiny ImageNet
-        kwargs["patch_size"] = 4
-        kwargs["num_hidden_layers"] = 12
-        kwargs["hidden_size"] = 768
-        kwargs["num_attention_heads"] = 12
-        kwargs["attention_probs_dropout_prob"] = 0.1
-        kwargs["hidden_dropout_prob"] = 0.1
+        kwargs.setdefault("patch_size", 4)
+        kwargs.setdefault("num_hidden_layers", 12)
+        kwargs.setdefault("hidden_size", 768)
+        kwargs.setdefault("num_attention_heads", 12)
+        kwargs.setdefault("attention_probs_dropout_prob", 0.1)
+        kwargs.setdefault("hidden_dropout_prob", 0.1)
     else:
         raise ValueError(f"Invalid image size: {image_size}")
     if is_dblock:

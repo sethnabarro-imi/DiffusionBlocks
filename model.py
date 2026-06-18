@@ -345,6 +345,13 @@ class ViTModel(L.LightningModule):
         self.eval_results_by_split = {}
         self.save_hyperparameters(args)
 
+    def architecture_kwargs(self) -> dict:
+        return {
+            "num_hidden_layers": self.args.num_hidden_layers,
+            "attention_probs_dropout_prob": self.args.attention_probs_dropout_prob,
+            "hidden_dropout_prob": self.args.hidden_dropout_prob,
+        }
+
     def build_eval_metrics(self, prefix: str):
         return torchmetrics.MetricCollection(
             {
@@ -361,7 +368,11 @@ class ViTModel(L.LightningModule):
         )
 
     def configure_model(self):
-        self.model = load_vit(image_size=self.image_size, num_labels=self.num_labels)
+        self.model = load_vit(
+            image_size=self.image_size,
+            num_labels=self.num_labels,
+            **self.architecture_kwargs(),
+        )
         print(self.model)
         if self.args.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
@@ -561,7 +572,10 @@ class ViTDBlockModel(ViTModel):
 
     def configure_model(self):
         self.model = load_vit(
-            image_size=self.image_size, num_labels=self.num_labels, is_dblock=True
+            image_size=self.image_size,
+            num_labels=self.num_labels,
+            is_dblock=True,
+            **self.architecture_kwargs(),
         )
         self.build_layer_prediction_metrics()
         print(self.model)
