@@ -542,6 +542,7 @@ class ViTDBlockModel(ViTModel):
             get_discrete_sigmas(num_steps=self.num_inference_steps, dblock=True).to(
                 self.device
             ),
+            persistent=False,
         )
         self.save_hyperparameters(
             {
@@ -564,6 +565,19 @@ class ViTDBlockModel(ViTModel):
         )
         self.build_layer_prediction_metrics()
         print(self.model)
+
+    def on_load_checkpoint(self, checkpoint):
+        state_dict = checkpoint.get("state_dict")
+        if state_dict is None:
+            return
+        for key in list(state_dict):
+            if key == "sigmas" or key.startswith(
+                (
+                    "intermediate_prediction_metrics.",
+                    "layer_prediction_metrics.",
+                )
+            ):
+                state_dict.pop(key)
 
     def build_layer_prediction_metrics(self):
         layer_points = self.num_inference_steps * self.layers_per_block()
