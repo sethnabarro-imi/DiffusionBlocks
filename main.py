@@ -172,16 +172,27 @@ def write_eval_results(args, data, logdir, ckpt_path, split_results):
         "epsilon_seed": args.epsilon_seed,
         "num_prediction_samples": args.num_prediction_samples,
         "prediction_average": args.prediction_average,
+        "trace_block_layers": getattr(args, "trace_block_layers", False),
+        "trace_intermediate_predictions": (
+            getattr(args, "trace_intermediate_predictions", False)
+            or getattr(args, "trace_block_layers", False)
+        ),
+        "trace_prediction_examples": getattr(args, "trace_prediction_examples", 16),
         "splits": {},
     }
     for split, metrics in split_results.items():
-        payload["splits"][split] = {
+        split_payload = {
             "accuracy": metrics.get("acc"),
             "f1": metrics.get("f1"),
             "ece": metrics.get("ece"),
             "log_likelihood": metrics.get("log_likelihood"),
             "ece_bins": metrics.get("ece_bins", []),
         }
+        if "intermediate_predictions" in metrics:
+            split_payload["intermediate_predictions"] = metrics[
+                "intermediate_predictions"
+            ]
+        payload["splits"][split] = split_payload
     path = _write_json_once(os.path.join(logdir, "eval_results.json"), payload)
     print(f"Wrote eval results: {path}")
 
@@ -329,6 +340,22 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="if set, reset epsilon sampling to this seed for every dblock noise draw",
+    )
+    parser.add_argument(
+        "--trace_intermediate_predictions",
+        action="store_true",
+        help="record per-denoising-step DBlock prediction diagnostics during eval",
+    )
+    parser.add_argument(
+        "--trace_block_layers",
+        action="store_true",
+        help="also record predictions after each transformer layer inside each DBlock",
+    )
+    parser.add_argument(
+        "--trace_prediction_examples",
+        type=int,
+        default=16,
+        help="number of per-example DBlock prediction traces to include in eval JSON",
     )
     args = parser.parse_args()
     main(args)
