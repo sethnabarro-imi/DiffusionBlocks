@@ -10,7 +10,7 @@ import sys
 import torch
 import lightning as L
 from lightning.pytorch.loggers import WandbLogger
-from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
+from lightning.pytorch.callbacks import Callback, ModelCheckpoint, LearningRateMonitor
 from lightning.pytorch.strategies import DDPStrategy, DeepSpeedStrategy
 
 from data import load_data
@@ -197,6 +197,159 @@ def write_eval_results(args, data, logdir, ckpt_path, split_results):
     print(f"Wrote eval results: {path}")
 
 
+def move_batch_to_device(batch, device):
+    if torch.is_tensor(batch):
+        return batch.to(device)
+    if isinstance(batch, dict):
+        return {key: move_batch_to_device(value, device) for key, value in batch.items()}
+    if isinstance(batch, list):
+        return [move_batch_to_device(value, device) for value in batch]
+    if isinstance(batch, tuple):
+        return tuple(move_batch_to_device(value, device) for value in batch)
+    return batch
+
+
+def compute_eval_split_results(model, split):
+    metrics = model.get_eval_metrics(split)
+    split_results = {}
+    for metric_name, metric in metrics.items():
+        with metric.sync_context():
+            value = metric.compute().detach().float().cpu().item()
+        split_results[model.strip_metric_prefix(metric_name)] = value
+
+    calibration_metric = model.get_calibration_metric(split)
+    with calibration_metric.sync_context():
+        stats = calibration_metric.calibration_stats()
+    split_results["ece_bins"] = model.calibration_rows(stats)
+
+    if getattr(model, "trace_intermediate_predictions", False):
+        split_results["intermediate_predictions"] = (
+            model.intermediate_prediction_results(split)
+        )
+    return split_results
+
+
+def reset_eval_split_metrics(model, split):
+    model.get_eval_metrics(split).reset()
+    if getattr(model, "trace_intermediate_predictions", False):
+        model.get_intermediate_prediction_metric(split).reset()
+        model.intermediate_prediction_examples_by_split[split] = []
+        if getattr(model, "trace_block_layers", False):
+            model.get_layer_prediction_metric(split).reset()
+            model.layer_prediction_examples_by_split[split] = []
+
+
+def run_current_model_split_evaluation(model, dataloader, split):
+    previous_eval_split = model.eval_split
+    model.eval_split = split
+    reset_eval_split_metrics(model, split)
+    with torch.no_grad():
+        for batch in dataloader:
+            batch = move_batch_to_device(batch, model.device)
+            model_kwargs = model.get_model_kwargs(batch)
+            model.shared_step(
+                batch,
+                step=split,
+                return_metrics=True,
+                **model_kwargs,
+            )
+    split_results = compute_eval_split_results(model, split)
+    model.eval_split = previous_eval_split
+    return split_results
+
+
+def write_blockwise_training_eval_results(
+    args,
+    data,
+    logdir,
+    split_results,
+    epoch,
+    step,
+):
+    if int(os.environ.get("LOCAL_RANK", "0")) != 0:
+        return
+    payload = {
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "dataset_name": args.data_name,
+        "dataset_source": data.data_name,
+        "model_type": args.model_type,
+        "epoch": epoch,
+        "global_step": step,
+        "ece_num_bins": args.ece_num_bins,
+        "input_noise_std": args.input_noise_std,
+        "epsilon_seed": args.epsilon_seed,
+        "num_prediction_samples": args.num_prediction_samples,
+        "prediction_average": args.prediction_average,
+        "trace_block_layers": getattr(args, "trace_block_layers", False),
+        "trace_intermediate_predictions": True,
+        "trace_prediction_examples": getattr(args, "trace_prediction_examples", 16),
+        "splits": {},
+    }
+    for split, metrics in split_results.items():
+        split_payload = {
+            "accuracy": metrics.get("acc"),
+            "f1": metrics.get("f1"),
+            "ece": metrics.get("ece"),
+            "log_likelihood": metrics.get("log_likelihood"),
+            "ece_bins": metrics.get("ece_bins", []),
+        }
+        if "intermediate_predictions" in metrics:
+            split_payload["intermediate_predictions"] = metrics[
+                "intermediate_predictions"
+            ]
+        payload["splits"][split] = split_payload
+    path = _write_json_once(
+        os.path.join(logdir, f"blockwise_eval_epoch_{epoch:05d}.json"),
+        payload,
+    )
+    print(f"Wrote periodic blockwise eval results: {path}")
+
+
+class PeriodicBlockwiseEvalCallback(Callback):
+    def __init__(self, data, args, logdir):
+        super().__init__()
+        self.data = data
+        self.args = args
+        self.logdir = logdir
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        frequency = self.args.blockwise_eval_every_n_epochs
+        if frequency <= 0:
+            return
+        epoch = trainer.current_epoch + 1
+        if epoch % frequency != 0:
+            return
+
+        was_training = pl_module.training
+        pl_module.eval()
+        split_results = {}
+        if "train_eval" in self.data.datasets:
+            trainer.print(f"Running blockwise train_eval diagnostics at epoch {epoch}")
+            split_results["train_eval"] = run_current_model_split_evaluation(
+                pl_module,
+                self.data.train_eval_dataloader(),
+                "train_eval",
+            )
+        if self.data.test_key is not None:
+            trainer.print(f"Running blockwise test diagnostics at epoch {epoch}")
+            split_results["test"] = run_current_model_split_evaluation(
+                pl_module,
+                self.data.test_dataloader(),
+                "test",
+            )
+        if was_training:
+            pl_module.train()
+
+        write_blockwise_training_eval_results(
+            self.args,
+            self.data,
+            self.logdir,
+            split_results,
+            epoch=epoch,
+            step=trainer.global_step,
+        )
+
+
 def run_train_test_evaluation(trainer, model, data, ckpt_path, args, logdir):
     model.eval_results_by_split = {}
     data.setup("test")
@@ -222,10 +375,16 @@ def validate_args(args):
         value = getattr(args, key)
         if value < 0.0 or value > 1.0:
             raise ValueError(f"--{key} must be between 0 and 1")
+    if args.blockwise_eval_every_n_epochs < 0:
+        raise ValueError("--blockwise_eval_every_n_epochs must be non-negative")
+    if args.blockwise_eval_every_n_epochs > 0 and args.model_type != "dblock":
+        raise ValueError("--blockwise_eval_every_n_epochs is only supported for dblock")
 
 
 def main(args):
     validate_args(args)
+    if args.blockwise_eval_every_n_epochs > 0:
+        args.trace_intermediate_predictions = True
     L.seed_everything(args.seed)
 
     data = load_data(args)
@@ -253,26 +412,29 @@ def main(args):
         save_dir=logdir,
         # group=f"{args.data_name}",
     )
+    callbacks = [
+        ModelCheckpoint(
+            dirpath=logdir,
+            monitor="val/acc" if data.val_key is not None else None,
+            mode="max",
+            save_top_k=args.save_top_k,
+            save_on_train_epoch_end=True,
+            every_n_epochs=args.save_every_n_epochs
+            if data.val_key is None
+            else None,
+            save_last=True,
+        ),
+        LearningRateMonitor(logging_interval="step"),
+    ]
+    if args.blockwise_eval_every_n_epochs > 0:
+        callbacks.append(PeriodicBlockwiseEvalCallback(data, args, logdir))
     trainer = L.Trainer(
         max_epochs=args.num_epochs
         if args.model_type != "dblock"
         else args.num_epochs
         * args.num_blocks,  # to align total number of iterations across the entire network because one step corresponds to one block
         check_val_every_n_epoch=args.save_every_n_epochs,
-        callbacks=[
-            ModelCheckpoint(
-                dirpath=logdir,
-                monitor="val/acc" if data.val_key is not None else None,
-                mode="max",
-                save_top_k=args.save_top_k,
-                save_on_train_epoch_end=True,
-                every_n_epochs=args.save_every_n_epochs
-                if data.val_key is None
-                else None,
-                save_last=True,
-            ),
-            LearningRateMonitor(logging_interval="step"),
-        ],
+        callbacks=callbacks,
         accumulate_grad_batches=args.accumulate_grad_batches,
         gradient_clip_val=1.0,
         strategy=DDPStrategy(find_unused_parameters=args.model_type == "dblock")
@@ -384,6 +546,15 @@ if __name__ == "__main__":
         type=int,
         default=16,
         help="number of per-example DBlock prediction traces to include in eval JSON",
+    )
+    parser.add_argument(
+        "--blockwise_eval_every_n_epochs",
+        type=int,
+        default=0,
+        help=(
+            "during training, run blockwise prediction diagnostics on train_eval "
+            "and test every N Lightning epochs; 0 disables this"
+        ),
     )
     args = parser.parse_args()
     main(args)
