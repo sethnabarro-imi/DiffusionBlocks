@@ -172,6 +172,9 @@ def write_eval_results(args, data, logdir, ckpt_path, split_results):
         "epsilon_seed": args.epsilon_seed,
         "num_prediction_samples": args.num_prediction_samples,
         "prediction_average": args.prediction_average,
+        "sequential_denoising_training": getattr(
+            args, "sequential_denoising_training", False
+        ),
         "trace_block_layers": getattr(args, "trace_block_layers", False),
         "trace_intermediate_predictions": (
             getattr(args, "trace_intermediate_predictions", False)
@@ -297,6 +300,9 @@ def write_blockwise_training_eval_results(
         "epsilon_seed": args.epsilon_seed,
         "num_prediction_samples": args.num_prediction_samples,
         "prediction_average": args.prediction_average,
+        "sequential_denoising_training": getattr(
+            args, "sequential_denoising_training", False
+        ),
         "trace_block_layers": getattr(args, "trace_block_layers", False),
         "trace_intermediate_predictions": True,
         "trace_oracle_noise_predictions": getattr(
@@ -405,6 +411,8 @@ def validate_args(args):
         raise ValueError("--blockwise_eval_every_n_epochs is only supported for dblock")
     if args.trace_oracle_noise_predictions and args.model_type != "dblock":
         raise ValueError("--trace_oracle_noise_predictions is only supported for dblock")
+    if args.sequential_denoising_training and args.model_type != "dblock":
+        raise ValueError("--sequential_denoising_training is only supported for dblock")
 
 
 def main(args):
@@ -454,11 +462,14 @@ def main(args):
     ]
     if args.blockwise_eval_every_n_epochs > 0:
         callbacks.append(PeriodicBlockwiseEvalCallback(data, args, logdir))
+    max_epochs = args.num_epochs
+    if args.model_type == "dblock" and not args.sequential_denoising_training:
+        # In the original independent-block objective, each optimizer step trains
+        # only one sampled block, so multiply epochs to keep per-block updates
+        # comparable with a full-network ViT epoch count.
+        max_epochs = args.num_epochs * args.num_blocks
     trainer = L.Trainer(
-        max_epochs=args.num_epochs
-        if args.model_type != "dblock"
-        else args.num_epochs
-        * args.num_blocks,  # to align total number of iterations across the entire network because one step corresponds to one block
+        max_epochs=max_epochs,
         check_val_every_n_epoch=args.save_every_n_epochs,
         callbacks=callbacks,
         accumulate_grad_batches=args.accumulate_grad_batches,
@@ -551,6 +562,15 @@ if __name__ == "__main__":
     )
     parser.add_argument("--cfg_scale", type=float, default=0.0)
     parser.add_argument("--class_dropout_prob", type=float, default=0.0)
+    parser.add_argument(
+        "--sequential_denoising_training",
+        action="store_true",
+        help=(
+            "train DBlock by running the full denoising chain in each training "
+            "step, feeding each block the Euler-updated output from the previous "
+            "block; off keeps the original independent-block training objective"
+        ),
+    )
     parser.add_argument(
         "--epsilon_seed",
         type=int,

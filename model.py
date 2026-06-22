@@ -516,6 +516,9 @@ class ViTDBlockModel(ViTModel):
         self.num_prediction_samples = self.args.num_prediction_samples
         self.prediction_average = self.args.prediction_average
         self.num_inference_steps = self.args.num_inference_steps or self.args.num_blocks
+        self.sequential_denoising_training = getattr(
+            self.args, "sequential_denoising_training", False
+        )
         self.trace_block_layers = getattr(self.args, "trace_block_layers", False)
         self.trace_intermediate_predictions = (
             getattr(self.args, "trace_intermediate_predictions", False)
@@ -581,6 +584,9 @@ class ViTDBlockModel(ViTModel):
                 "num_inference_steps": self.num_inference_steps,
                 "num_prediction_samples": self.num_prediction_samples,
                 "prediction_average": self.prediction_average,
+                "sequential_denoising_training": (
+                    self.sequential_denoising_training
+                ),
                 "cfg_scale": self.cfg_scale,
                 "class_dropout_prob": self.class_dropout_prob,
                 "trace_intermediate_predictions": self.trace_intermediate_predictions,
@@ -1355,6 +1361,13 @@ class ViTDBlockModel(ViTModel):
             else:
                 raise NotImplementedError(f"Step {step} is not supported")
 
+        if self.sequential_denoising_training:
+            return self.sequential_denoising_training_step(
+                pixel_values,
+                labels,
+                step=step,
+            )
+
         z = self.get_embeds(labels, is_input=True)
         sigmas = self.get_sigmas(z.shape[0])
         block_idx = self.estimate_target_layer(sigmas)
@@ -1374,6 +1387,66 @@ class ViTDBlockModel(ViTModel):
             f"{step}/ce_loss": ce_loss,
             f"{step}/ce_loss_{block_idx}": ce_loss,
         }
+        return loss, loss_dict
+
+    def denoised_embedding_from_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        probs = F.softmax(logits, dim=1)
+        return F.linear(probs, self.model.get_input_embeddings().weight.t())
+
+    def sequential_denoising_training_step(
+        self,
+        pixel_values: torch.Tensor,
+        labels: torch.Tensor,
+        step: str = "train",
+    ):
+        batch_size = pixel_values.shape[0]
+        hidden_size = self.model.config.hidden_size
+        labels = labels.view(-1)
+        z = self.sample_epsilon(
+            (batch_size, hidden_size),
+            device=pixel_values.device,
+            dtype=pixel_values.dtype,
+        )
+        z = z * torch.sqrt(1.0 + self.sigmas[0].to(z) ** 2.0)
+        s_in = pixel_values.new_ones([batch_size])
+
+        losses = []
+        ce_losses = []
+        loss_dict = {}
+
+        for step_index in range(self.sigmas.shape[0]):
+            sigma = self.sigmas[step_index] * s_in
+            block_idx = self.estimate_target_layer(sigma)
+            logits = self.denoise(pixel_values, z, sigma, block_idx=block_idx)
+            per_example_loss = F.cross_entropy(
+                logits.view(-1, self.num_labels),
+                labels,
+                reduction="none",
+            )
+            ce_loss = per_example_loss.mean()
+            weighted_loss = (per_example_loss * self.get_weights(sigma)).mean()
+            losses.append(weighted_loss)
+            ce_losses.append(ce_loss)
+            loss_dict[f"{step}/loss_step_{step_index}"] = weighted_loss
+            loss_dict[f"{step}/ce_loss_step_{step_index}"] = ce_loss
+            loss_dict[f"{step}/loss_block_{block_idx}"] = weighted_loss
+            loss_dict[f"{step}/ce_loss_block_{block_idx}"] = ce_loss
+            loss_dict[f"{step}/loss_{block_idx}"] = weighted_loss
+            loss_dict[f"{step}/ce_loss_{block_idx}"] = ce_loss
+
+            if step_index == self.sigmas.shape[0] - 1:
+                continue
+
+            next_sigma = self.sigmas[step_index + 1] * s_in
+            denoised = self.denoised_embedding_from_logits(logits)
+            d = (z - denoised) / sigma[:, None]
+            z = z + (next_sigma - sigma)[:, None] * d
+            z = z.detach()
+
+        loss = torch.stack(losses).mean()
+        ce_loss = torch.stack(ce_losses).mean()
+        loss_dict[f"{step}/loss"] = loss
+        loss_dict[f"{step}/ce_loss"] = ce_loss
         return loss, loss_dict
 
     def diffusion_step(self, x, return_intermediates: bool = False):
@@ -1548,8 +1621,7 @@ class ViTDBlockModel(ViTModel):
                         layers_in_block_trace=layers_in_block_trace,
                         layer_sigmas=layer_sigmas,
                     )
-            probs = F.softmax(logits, dim=1)
-            denoised = F.linear(probs, self.model.get_input_embeddings().weight.t())
+            denoised = self.denoised_embedding_from_logits(logits)
             # to d
             d = (z - denoised) / sigma[:, None]
             dt = next_sigma - sigma
