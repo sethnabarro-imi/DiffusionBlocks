@@ -521,6 +521,9 @@ class ViTDBlockModel(ViTModel):
             getattr(self.args, "trace_intermediate_predictions", False)
             or self.trace_block_layers
         )
+        self.trace_oracle_noise_predictions = getattr(
+            self.args, "trace_oracle_noise_predictions", False
+        )
         self.trace_prediction_examples = getattr(
             self.args, "trace_prediction_examples", 16
         )
@@ -537,13 +540,30 @@ class ViTDBlockModel(ViTModel):
                 for split in ["val", "train_eval", "test"]
             }
         )
+        self.oracle_noise_prediction_metrics = torch.nn.ModuleDict(
+            {
+                split: DBlockIntermediatePredictionMetric(self.num_inference_steps)
+                for split in ["val", "train_eval", "test"]
+            }
+        )
         self.layer_prediction_metrics = None
+        self.oracle_noise_layer_prediction_metrics = None
         self.intermediate_prediction_examples_by_split = {
             "val": [],
             "train_eval": [],
             "test": [],
         }
+        self.oracle_noise_prediction_examples_by_split = {
+            "val": [],
+            "train_eval": [],
+            "test": [],
+        }
         self.layer_prediction_examples_by_split = {
+            "val": [],
+            "train_eval": [],
+            "test": [],
+        }
+        self.oracle_noise_layer_prediction_examples_by_split = {
             "val": [],
             "train_eval": [],
             "test": [],
@@ -564,6 +584,9 @@ class ViTDBlockModel(ViTModel):
                 "cfg_scale": self.cfg_scale,
                 "class_dropout_prob": self.class_dropout_prob,
                 "trace_intermediate_predictions": self.trace_intermediate_predictions,
+                "trace_oracle_noise_predictions": (
+                    self.trace_oracle_noise_predictions
+                ),
                 "trace_block_layers": self.trace_block_layers,
                 "trace_prediction_examples": self.trace_prediction_examples,
                 "epsilon_seed": self.epsilon_seed,
@@ -588,7 +611,9 @@ class ViTDBlockModel(ViTModel):
             if key == "sigmas" or key.startswith(
                 (
                     "intermediate_prediction_metrics.",
+                    "oracle_noise_prediction_metrics.",
                     "layer_prediction_metrics.",
+                    "oracle_noise_layer_prediction_metrics.",
                 )
             ):
                 state_dict.pop(key)
@@ -596,6 +621,12 @@ class ViTDBlockModel(ViTModel):
     def build_layer_prediction_metrics(self):
         layer_points = self.num_inference_steps * self.layers_per_block()
         self.layer_prediction_metrics = torch.nn.ModuleDict(
+            {
+                split: DBlockIntermediatePredictionMetric(layer_points)
+                for split in ["val", "train_eval", "test"]
+            }
+        )
+        self.oracle_noise_layer_prediction_metrics = torch.nn.ModuleDict(
             {
                 split: DBlockIntermediatePredictionMetric(layer_points)
                 for split in ["val", "train_eval", "test"]
@@ -770,15 +801,28 @@ class ViTDBlockModel(ViTModel):
             if self.trace_block_layers:
                 self.get_layer_prediction_metric(self.eval_split).reset()
                 self.layer_prediction_examples_by_split[self.eval_split] = []
+        if self.trace_oracle_noise_predictions:
+            self.get_oracle_noise_prediction_metric(self.eval_split).reset()
+            self.oracle_noise_prediction_examples_by_split[self.eval_split] = []
+            if self.trace_block_layers:
+                self.get_oracle_noise_layer_prediction_metric(
+                    self.eval_split
+                ).reset()
+                self.oracle_noise_layer_prediction_examples_by_split[
+                    self.eval_split
+                ] = []
 
     def on_test_epoch_end(self):
         super().on_test_epoch_end()
-        if not self.trace_intermediate_predictions:
-            return
         if self.trainer.is_global_zero:
-            self.eval_results_by_split[self.eval_split][
-                "intermediate_predictions"
-            ] = self.intermediate_prediction_results(self.eval_split)
+            if self.trace_intermediate_predictions:
+                self.eval_results_by_split[self.eval_split][
+                    "intermediate_predictions"
+                ] = self.intermediate_prediction_results(self.eval_split)
+            if self.trace_oracle_noise_predictions:
+                self.eval_results_by_split[self.eval_split][
+                    "oracle_noise_predictions"
+                ] = self.oracle_noise_prediction_results(self.eval_split)
 
     def get_intermediate_prediction_metric(self, split: str):
         if split not in self.intermediate_prediction_metrics:
@@ -791,6 +835,18 @@ class ViTDBlockModel(ViTModel):
         if split not in self.layer_prediction_metrics:
             raise NotImplementedError(f"Step {split} is not supported")
         return self.layer_prediction_metrics[split]
+
+    def get_oracle_noise_prediction_metric(self, split: str):
+        if split not in self.oracle_noise_prediction_metrics:
+            raise NotImplementedError(f"Step {split} is not supported")
+        return self.oracle_noise_prediction_metrics[split]
+
+    def get_oracle_noise_layer_prediction_metric(self, split: str):
+        if self.oracle_noise_layer_prediction_metrics is None:
+            self.build_layer_prediction_metrics()
+        if split not in self.oracle_noise_layer_prediction_metrics:
+            raise NotImplementedError(f"Step {split} is not supported")
+        return self.oracle_noise_layer_prediction_metrics[split]
 
     def intermediate_prediction_results(self, split: str) -> dict:
         metric = self.get_intermediate_prediction_metric(split)
@@ -810,6 +866,29 @@ class ViTDBlockModel(ViTModel):
                 layer_stats = layer_metric.compute()
             results["layer_rows"] = self.layer_prediction_rows(layer_stats)
             results["layer_examples"] = self.layer_prediction_examples_by_split[split]
+        return results
+
+    def oracle_noise_prediction_results(self, split: str) -> dict:
+        metric = self.get_oracle_noise_prediction_metric(split)
+        with metric.sync_context():
+            stats = metric.compute()
+        rows = self.intermediate_prediction_rows(stats)
+        results = {
+            "prediction_average": self.prediction_average,
+            "num_prediction_samples": self.num_prediction_samples,
+            "num_inference_steps": self.num_inference_steps,
+            "input_type": "oracle_label_embedding_plus_noise",
+            "rows": rows,
+            "examples": self.oracle_noise_prediction_examples_by_split[split],
+        }
+        if self.trace_block_layers:
+            layer_metric = self.get_oracle_noise_layer_prediction_metric(split)
+            with layer_metric.sync_context():
+                layer_stats = layer_metric.compute()
+            results["layer_rows"] = self.layer_prediction_rows(layer_stats)
+            results["layer_examples"] = (
+                self.oracle_noise_layer_prediction_examples_by_split[split]
+            )
         return results
 
     def intermediate_prediction_rows(
@@ -967,6 +1046,30 @@ class ViTDBlockModel(ViTModel):
                 }
             )
 
+    def record_oracle_noise_predictions(
+        self,
+        trace: dict[str, torch.Tensor],
+        labels: torch.Tensor,
+    ) -> None:
+        labels = labels.view(-1)
+        self.get_oracle_noise_prediction_metric(self.eval_split).update(
+            trace["logits"],
+            labels,
+            trace["block_indices"],
+            trace["sigmas"],
+        )
+        if self.trace_block_layers and "layer_logits" in trace:
+            self.get_oracle_noise_layer_prediction_metric(self.eval_split).update(
+                trace["layer_logits"],
+                labels,
+                trace["layer_block_indices"],
+                trace["layer_sigmas"],
+                denoise_step_indices=trace["layer_denoise_step_indices"],
+                layer_indices=trace["layer_indices"],
+                layer_positions=trace["layer_positions"],
+                layers_in_block=trace["layers_in_block"],
+            )
+
     def record_layer_prediction_examples(
         self,
         trace: dict[str, torch.Tensor],
@@ -1032,6 +1135,185 @@ class ViTDBlockModel(ViTModel):
                 }
             )
 
+    def oracle_noise_sample(
+        self,
+        x: torch.Tensor,
+        labels: torch.Tensor,
+        return_layer_logits: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        labels = labels.view(-1)
+        z = self.get_embeds(labels, is_input=True)
+        oracle_logits = []
+        block_indices = []
+        sigmas_trace = []
+        layer_logits = []
+        layer_denoise_step_indices = []
+        layer_block_indices = []
+        layer_indices_trace = []
+        layer_positions = []
+        layers_in_block_trace = []
+        layer_sigmas = []
+        s_in = x.new_ones([x.shape[0]])
+        for step_index, sigma_value in enumerate(self.sigmas):
+            sigma = sigma_value * s_in
+            block_idx = self.estimate_target_layer(sigma)
+            zt = z + sigma[:, None] * self.sample_epsilon_like(z)
+            denoise_output = self.denoise(
+                x,
+                zt,
+                sigma,
+                block_idx=block_idx,
+                return_layer_logits=return_layer_logits,
+            )
+            if isinstance(denoise_output, dict):
+                logits = denoise_output["logits"]
+                self.append_layer_trace(
+                    denoise_output,
+                    denoise_step_index=step_index,
+                    block_idx=block_idx,
+                    sigma=sigma_value,
+                    layer_logits=layer_logits,
+                    layer_denoise_step_indices=layer_denoise_step_indices,
+                    layer_block_indices=layer_block_indices,
+                    layer_indices_trace=layer_indices_trace,
+                    layer_positions=layer_positions,
+                    layers_in_block_trace=layers_in_block_trace,
+                    layer_sigmas=layer_sigmas,
+                )
+            else:
+                logits = denoise_output
+            oracle_logits.append(logits)
+            block_indices.append(block_idx)
+            sigmas_trace.append(sigma_value)
+
+        sample = {
+            "logits": torch.stack(oracle_logits),
+            "block_indices": torch.tensor(
+                block_indices, device=x.device, dtype=torch.long
+            ),
+            "sigmas": torch.stack(sigmas_trace).to(x.device),
+        }
+        if layer_logits:
+            sample.update(
+                {
+                    "layer_logits": torch.cat(layer_logits),
+                    "layer_denoise_step_indices": torch.tensor(
+                        layer_denoise_step_indices,
+                        device=x.device,
+                        dtype=torch.long,
+                    ),
+                    "layer_block_indices": torch.tensor(
+                        layer_block_indices,
+                        device=x.device,
+                        dtype=torch.long,
+                    ),
+                    "layer_indices": torch.tensor(
+                        layer_indices_trace,
+                        device=x.device,
+                        dtype=torch.long,
+                    ),
+                    "layer_positions": torch.tensor(
+                        layer_positions,
+                        device=x.device,
+                        dtype=torch.long,
+                    ),
+                    "layers_in_block": torch.tensor(
+                        layers_in_block_trace,
+                        device=x.device,
+                        dtype=torch.long,
+                    ),
+                    "layer_sigmas": torch.stack(layer_sigmas).to(x.device),
+                }
+            )
+        return sample
+
+    def oracle_noise_step(
+        self,
+        x: torch.Tensor,
+        labels: torch.Tensor,
+        return_layer_logits: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        trace_outputs = None
+        layer_trace_outputs = None
+        trace_metadata = None
+        layer_trace_metadata = None
+        for _ in range(self.num_prediction_samples):
+            sample = self.oracle_noise_sample(
+                x,
+                labels,
+                return_layer_logits=return_layer_logits,
+            )
+            trace_logits = sample["logits"]
+            trace_metadata = {
+                "block_indices": sample["block_indices"],
+                "sigmas": sample["sigmas"],
+            }
+            if "layer_logits" in sample:
+                layer_trace_logits = sample["layer_logits"]
+                layer_trace_metadata = {
+                    "layer_denoise_step_indices": sample[
+                        "layer_denoise_step_indices"
+                    ],
+                    "layer_block_indices": sample["layer_block_indices"],
+                    "layer_indices": sample["layer_indices"],
+                    "layer_positions": sample["layer_positions"],
+                    "layers_in_block": sample["layers_in_block"],
+                    "layer_sigmas": sample["layer_sigmas"],
+                }
+
+            if self.prediction_average == "probability":
+                sample_trace_output = F.softmax(trace_logits.float(), dim=-1)
+                if "layer_logits" in sample:
+                    sample_layer_trace_output = F.softmax(
+                        layer_trace_logits.float(), dim=-1
+                    )
+            elif self.prediction_average == "logit":
+                sample_trace_output = trace_logits.float()
+                if "layer_logits" in sample:
+                    sample_layer_trace_output = layer_trace_logits.float()
+            else:
+                raise ValueError(
+                    f"Unsupported prediction_average: {self.prediction_average}"
+                )
+
+            trace_outputs = (
+                sample_trace_output
+                if trace_outputs is None
+                else trace_outputs + sample_trace_output
+            )
+            if "layer_logits" in sample:
+                layer_trace_outputs = (
+                    sample_layer_trace_output
+                    if layer_trace_outputs is None
+                    else layer_trace_outputs + sample_layer_trace_output
+                )
+
+        trace_outputs = trace_outputs / self.num_prediction_samples
+        if layer_trace_outputs is not None:
+            layer_trace_outputs = layer_trace_outputs / self.num_prediction_samples
+        if self.prediction_average == "probability":
+            trace_outputs = trace_outputs.clamp_min(
+                torch.finfo(trace_outputs.dtype).tiny
+            ).log()
+            if layer_trace_outputs is not None:
+                layer_trace_outputs = layer_trace_outputs.clamp_min(
+                    torch.finfo(layer_trace_outputs.dtype).tiny
+                ).log()
+
+        trace = {
+            "logits": trace_outputs,
+            "block_indices": trace_metadata["block_indices"],
+            "sigmas": trace_metadata["sigmas"],
+        }
+        if layer_trace_outputs is not None:
+            trace.update(
+                {
+                    "layer_logits": layer_trace_outputs,
+                    **layer_trace_metadata,
+                }
+            )
+        return trace
+
     def shared_step(self, batch, step="train", return_metrics=False, **kwargs):
         pixel_values = batch["pixel_values"]
         labels = batch["labels"]
@@ -1041,6 +1323,13 @@ class ViTDBlockModel(ViTModel):
                 "train_eval",
                 "test",
             ]
+            should_trace_oracle_noise = (
+                self.trace_oracle_noise_predictions
+                and step in [
+                    "train_eval",
+                    "test",
+                ]
+            )
             if should_trace:
                 logits, trace = self.diffusion_step(
                     pixel_values, return_intermediates=True
@@ -1048,6 +1337,13 @@ class ViTDBlockModel(ViTModel):
                 self.record_intermediate_predictions(trace, labels)
             else:
                 logits = self.diffusion_step(pixel_values)
+            if should_trace_oracle_noise:
+                oracle_noise_trace = self.oracle_noise_step(
+                    pixel_values,
+                    labels,
+                    return_layer_logits=self.trace_block_layers,
+                )
+                self.record_oracle_noise_predictions(oracle_noise_trace, labels)
             logits = logits.view(-1, self.num_labels)
             labels = labels.view(-1)
             if step == "val":

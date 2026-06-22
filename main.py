@@ -177,6 +177,9 @@ def write_eval_results(args, data, logdir, ckpt_path, split_results):
             getattr(args, "trace_intermediate_predictions", False)
             or getattr(args, "trace_block_layers", False)
         ),
+        "trace_oracle_noise_predictions": getattr(
+            args, "trace_oracle_noise_predictions", False
+        ),
         "trace_prediction_examples": getattr(args, "trace_prediction_examples", 16),
         "splits": {},
     }
@@ -191,6 +194,10 @@ def write_eval_results(args, data, logdir, ckpt_path, split_results):
         if "intermediate_predictions" in metrics:
             split_payload["intermediate_predictions"] = metrics[
                 "intermediate_predictions"
+            ]
+        if "oracle_noise_predictions" in metrics:
+            split_payload["oracle_noise_predictions"] = metrics[
+                "oracle_noise_predictions"
             ]
         payload["splits"][split] = split_payload
     path = _write_json_once(os.path.join(logdir, "eval_results.json"), payload)
@@ -226,6 +233,10 @@ def compute_eval_split_results(model, split):
         split_results["intermediate_predictions"] = (
             model.intermediate_prediction_results(split)
         )
+    if getattr(model, "trace_oracle_noise_predictions", False):
+        split_results["oracle_noise_predictions"] = (
+            model.oracle_noise_prediction_results(split)
+        )
     return split_results
 
 
@@ -237,6 +248,12 @@ def reset_eval_split_metrics(model, split):
         if getattr(model, "trace_block_layers", False):
             model.get_layer_prediction_metric(split).reset()
             model.layer_prediction_examples_by_split[split] = []
+    if getattr(model, "trace_oracle_noise_predictions", False):
+        model.get_oracle_noise_prediction_metric(split).reset()
+        model.oracle_noise_prediction_examples_by_split[split] = []
+        if getattr(model, "trace_block_layers", False):
+            model.get_oracle_noise_layer_prediction_metric(split).reset()
+            model.oracle_noise_layer_prediction_examples_by_split[split] = []
 
 
 def run_current_model_split_evaluation(model, dataloader, split):
@@ -282,6 +299,9 @@ def write_blockwise_training_eval_results(
         "prediction_average": args.prediction_average,
         "trace_block_layers": getattr(args, "trace_block_layers", False),
         "trace_intermediate_predictions": True,
+        "trace_oracle_noise_predictions": getattr(
+            args, "trace_oracle_noise_predictions", False
+        ),
         "trace_prediction_examples": getattr(args, "trace_prediction_examples", 16),
         "splits": {},
     }
@@ -296,6 +316,10 @@ def write_blockwise_training_eval_results(
         if "intermediate_predictions" in metrics:
             split_payload["intermediate_predictions"] = metrics[
                 "intermediate_predictions"
+            ]
+        if "oracle_noise_predictions" in metrics:
+            split_payload["oracle_noise_predictions"] = metrics[
+                "oracle_noise_predictions"
             ]
         payload["splits"][split] = split_payload
     path = _write_json_once(
@@ -379,6 +403,8 @@ def validate_args(args):
         raise ValueError("--blockwise_eval_every_n_epochs must be non-negative")
     if args.blockwise_eval_every_n_epochs > 0 and args.model_type != "dblock":
         raise ValueError("--blockwise_eval_every_n_epochs is only supported for dblock")
+    if args.trace_oracle_noise_predictions and args.model_type != "dblock":
+        raise ValueError("--trace_oracle_noise_predictions is only supported for dblock")
 
 
 def main(args):
@@ -540,6 +566,14 @@ if __name__ == "__main__":
         "--trace_block_layers",
         action="store_true",
         help="also record predictions after each transformer layer inside each DBlock",
+    )
+    parser.add_argument(
+        "--trace_oracle_noise_predictions",
+        action="store_true",
+        help=(
+            "record oracle+noise DBlock diagnostics: each block predicts from "
+            "true label embeddings plus the corresponding scheduled noise"
+        ),
     )
     parser.add_argument(
         "--trace_prediction_examples",
