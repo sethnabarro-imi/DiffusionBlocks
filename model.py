@@ -1443,10 +1443,12 @@ class ViTDBlockModel(ViTModel):
             z = z + (next_sigma - sigma)[:, None] * d
             z = z.detach()
 
-        loss = torch.stack(losses).mean()
-        ce_loss = torch.stack(ce_losses).mean()
+        loss = torch.stack(losses).sum()
+        ce_loss = torch.stack(ce_losses).sum()
         loss_dict[f"{step}/loss"] = loss
         loss_dict[f"{step}/ce_loss"] = ce_loss
+        loss_dict[f"{step}/loss_mean"] = loss / len(losses)
+        loss_dict[f"{step}/ce_loss_mean"] = ce_loss / len(ce_losses)
         return loss, loss_dict
 
     def diffusion_step(self, x, return_intermediates: bool = False):
