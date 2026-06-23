@@ -12,12 +12,12 @@ Options:
                        Default: $DIFFUSIONBLOCKS_SCRATCH or ~/scratch/diffusionblocks
   --no-install-uv      Fail if uv is not already installed.
   --no-sync            Skip uv sync --frozen.
-  --no-login           Skip W&B and Hugging Face login.
+  --login              Log in to W&B and Hugging Face.
   --no-link-logs       Do not symlink ./logs to the scratch logs directory.
   -h, --help           Show this help.
 
-Set WANDB_API_KEY and HF_TOKEN to log in non-interactively. If they are not
-set, the script runs the normal interactive CLI login prompts.
+With --login, set WANDB_API_KEY and HF_TOKEN to log in non-interactively. If
+they are not set, the script runs the normal interactive CLI login prompts.
 EOF
 }
 
@@ -25,7 +25,7 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRATCH_DIR="${DIFFUSIONBLOCKS_SCRATCH:-"$HOME/scratch/diffusionblocks"}"
 INSTALL_UV=1
 RUN_SYNC=1
-RUN_LOGIN=1
+RUN_LOGIN=0
 LINK_LOGS=1
 
 while [[ $# -gt 0 ]]; do
@@ -42,8 +42,8 @@ while [[ $# -gt 0 ]]; do
       RUN_SYNC=0
       shift
       ;;
-    --no-login)
-      RUN_LOGIN=0
+    --login)
+      RUN_LOGIN=1
       shift
       ;;
     --no-link-logs)
@@ -176,5 +176,6 @@ Environment: $ENV_FILE
 
 Next:
   source .remote.env
+  scripts/prepare_remote.sh --login
   uv run main.py train cifar100 --model_type dblock
 EOF
