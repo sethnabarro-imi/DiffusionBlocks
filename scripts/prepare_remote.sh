@@ -12,13 +12,12 @@ Options:
                        Default: $DIFFUSIONBLOCKS_SCRATCH or ~/scratch/diffusionblocks
   --no-install-uv      Fail if uv is not already installed.
   --no-sync            Skip uv sync --frozen.
+  --no-login           Skip W&B and Hugging Face login.
   --no-link-logs       Do not symlink ./logs to the scratch logs directory.
   -h, --help           Show this help.
 
-After this script finishes, run:
-  source .remote.env
-  uv run huggingface-cli login
-  uv run wandb login
+Set WANDB_API_KEY and HF_TOKEN to log in non-interactively. If they are not
+set, the script runs the normal interactive CLI login prompts.
 EOF
 }
 
@@ -26,6 +25,7 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRATCH_DIR="${DIFFUSIONBLOCKS_SCRATCH:-"$HOME/scratch/diffusionblocks"}"
 INSTALL_UV=1
 RUN_SYNC=1
+RUN_LOGIN=1
 LINK_LOGS=1
 
 while [[ $# -gt 0 ]]; do
@@ -40,6 +40,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-sync)
       RUN_SYNC=0
+      shift
+      ;;
+    --no-login)
+      RUN_LOGIN=0
       shift
       ;;
     --no-link-logs)
@@ -142,6 +146,22 @@ EOF
   fi
 fi
 
+if [[ "$RUN_LOGIN" -eq 1 ]]; then
+  echo "Logging in to Weights & Biases..."
+  if [[ -n "${WANDB_API_KEY:-}" ]]; then
+    uv run wandb login --relogin "$WANDB_API_KEY"
+  else
+    uv run wandb login
+  fi
+
+  echo "Logging in to Hugging Face..."
+  if [[ -n "${HF_TOKEN:-}" ]]; then
+    uv run huggingface-cli login --token "$HF_TOKEN"
+  else
+    uv run huggingface-cli login
+  fi
+fi
+
 cat <<EOF
 
 Remote machine is prepared.
@@ -156,7 +176,5 @@ Environment: $ENV_FILE
 
 Next:
   source .remote.env
-  uv run huggingface-cli login
-  uv run wandb login
   uv run main.py train cifar100 --model_type dblock
 EOF
