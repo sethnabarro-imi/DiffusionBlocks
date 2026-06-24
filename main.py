@@ -175,6 +175,9 @@ def write_eval_results(args, data, logdir, ckpt_path, split_results):
         "sequential_denoising_training": getattr(
             args, "sequential_denoising_training", False
         ),
+        "hybrid_block0_independent_training": getattr(
+            args, "hybrid_block0_independent_training", False
+        ),
         "trace_block_layers": getattr(args, "trace_block_layers", False),
         "trace_intermediate_predictions": (
             getattr(args, "trace_intermediate_predictions", False)
@@ -303,6 +306,9 @@ def write_blockwise_training_eval_results(
         "sequential_denoising_training": getattr(
             args, "sequential_denoising_training", False
         ),
+        "hybrid_block0_independent_training": getattr(
+            args, "hybrid_block0_independent_training", False
+        ),
         "trace_block_layers": getattr(args, "trace_block_layers", False),
         "trace_intermediate_predictions": True,
         "trace_oracle_noise_predictions": getattr(
@@ -413,10 +419,16 @@ def validate_args(args):
         raise ValueError("--trace_oracle_noise_predictions is only supported for dblock")
     if args.sequential_denoising_training and args.model_type != "dblock":
         raise ValueError("--sequential_denoising_training is only supported for dblock")
+    if args.hybrid_block0_independent_training and args.model_type != "dblock":
+        raise ValueError(
+            "--hybrid_block0_independent_training is only supported for dblock"
+        )
 
 
 def main(args):
     validate_args(args)
+    if args.hybrid_block0_independent_training:
+        args.sequential_denoising_training = True
     if args.blockwise_eval_every_n_epochs > 0:
         args.trace_intermediate_predictions = True
     L.seed_everything(args.seed)
@@ -569,6 +581,16 @@ if __name__ == "__main__":
             "train DBlock by running the full denoising chain in each training "
             "step, feeding each block the Euler-updated output from the previous "
             "block; off keeps the original independent-block training objective"
+        ),
+    )
+    parser.add_argument(
+        "--hybrid_block0_independent_training",
+        action="store_true",
+        help=(
+            "train DBlock with block 0 using the original independent block-0 "
+            "noise objective, then feed its Euler-updated state into the "
+            "sequential denoising chain for the remaining blocks; implies "
+            "--sequential_denoising_training"
         ),
     )
     parser.add_argument(

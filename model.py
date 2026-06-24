@@ -519,6 +519,9 @@ class ViTDBlockModel(ViTModel):
         self.sequential_denoising_training = getattr(
             self.args, "sequential_denoising_training", False
         )
+        self.hybrid_block0_independent_training = getattr(
+            self.args, "hybrid_block0_independent_training", False
+        )
         self.trace_block_layers = getattr(self.args, "trace_block_layers", False)
         self.trace_intermediate_predictions = (
             getattr(self.args, "trace_intermediate_predictions", False)
@@ -586,6 +589,9 @@ class ViTDBlockModel(ViTModel):
                 "prediction_average": self.prediction_average,
                 "sequential_denoising_training": (
                     self.sequential_denoising_training
+                ),
+                "hybrid_block0_independent_training": (
+                    self.hybrid_block0_independent_training
                 ),
                 "cfg_scale": self.cfg_scale,
                 "class_dropout_prob": self.class_dropout_prob,
@@ -673,6 +679,44 @@ class ViTDBlockModel(ViTModel):
         block_idx = random.choices(range(self.args.num_blocks), k=1)[0]
         sigma_min_block = self.block_sigmas[block_idx]
         sigma_max_block = self.block_sigmas[block_idx + 1]
+        return self.sample_sigmas_from_interval(
+            n_samples,
+            sigma_min_block,
+            sigma_max_block,
+            p_mean=p_mean,
+            p_std=p_std,
+        )
+
+    def get_sigmas_for_target_block(
+        self,
+        n_samples: int,
+        target_block_idx: int,
+        p_mean: float = -1.2,
+        p_std: float = 1.2,
+    ):
+        if target_block_idx < 0 or target_block_idx >= self.args.num_blocks:
+            raise ValueError(
+                f"target_block_idx must be in [0, {self.args.num_blocks - 1}]"
+            )
+        sigma_interval_idx = (self.args.num_blocks - 1) - target_block_idx
+        sigma_min_block = self.block_sigmas[sigma_interval_idx]
+        sigma_max_block = self.block_sigmas[sigma_interval_idx + 1]
+        return self.sample_sigmas_from_interval(
+            n_samples,
+            sigma_min_block,
+            sigma_max_block,
+            p_mean=p_mean,
+            p_std=p_std,
+        )
+
+    def sample_sigmas_from_interval(
+        self,
+        n_samples: int,
+        sigma_min_block: float,
+        sigma_max_block: float,
+        p_mean: float = -1.2,
+        p_std: float = 1.2,
+    ):
         # extend the range
         if self.gamma > 0.0:
             log_sigma_min = np.log(sigma_min_block)
@@ -1361,6 +1405,13 @@ class ViTDBlockModel(ViTModel):
             else:
                 raise NotImplementedError(f"Step {step} is not supported")
 
+        if self.hybrid_block0_independent_training:
+            return self.hybrid_block0_independent_training_step(
+                pixel_values,
+                labels,
+                step=step,
+            )
+
         if self.sequential_denoising_training:
             return self.sequential_denoising_training_step(
                 pixel_values,
@@ -1393,6 +1444,66 @@ class ViTDBlockModel(ViTModel):
         probs = F.softmax(logits, dim=1)
         return F.linear(probs, self.model.get_input_embeddings().weight.t())
 
+    def append_denoising_loss(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        sigmas: torch.Tensor,
+        losses: list[torch.Tensor],
+        ce_losses: list[torch.Tensor],
+        loss_dict: dict[str, torch.Tensor],
+        *,
+        log_prefix: str,
+        step_index: int,
+        block_idx: int,
+        broadcast_weights: bool = False,
+    ) -> None:
+        per_example_loss = F.cross_entropy(
+            logits.view(-1, self.num_labels),
+            labels,
+            reduction="none",
+        )
+        ce_loss = per_example_loss.mean()
+        weights = self.get_weights(sigmas)
+        if broadcast_weights:
+            weights = weights[:, None]
+        weighted_loss = (per_example_loss * weights).mean()
+        losses.append(weighted_loss)
+        ce_losses.append(ce_loss)
+        loss_dict[f"{log_prefix}/loss_step_{step_index}"] = weighted_loss
+        loss_dict[f"{log_prefix}/ce_loss_step_{step_index}"] = ce_loss
+        loss_dict[f"{log_prefix}/loss_block_{block_idx}"] = weighted_loss
+        loss_dict[f"{log_prefix}/ce_loss_block_{block_idx}"] = ce_loss
+        loss_dict[f"{log_prefix}/loss_{block_idx}"] = weighted_loss
+        loss_dict[f"{log_prefix}/ce_loss_{block_idx}"] = ce_loss
+
+    def euler_update(
+        self,
+        z: torch.Tensor,
+        logits: torch.Tensor,
+        sigma: torch.Tensor,
+        next_sigma: torch.Tensor,
+    ) -> torch.Tensor:
+        denoised = self.denoised_embedding_from_logits(logits)
+        d = (z - denoised) / sigma[:, None]
+        z = z + (next_sigma - sigma)[:, None] * d
+        return z.detach()
+
+    def aggregate_denoising_losses(
+        self,
+        losses: list[torch.Tensor],
+        ce_losses: list[torch.Tensor],
+        loss_dict: dict[str, torch.Tensor],
+        step: str,
+    ):
+        loss = torch.stack(losses).sum()
+        ce_loss = torch.stack(ce_losses).sum()
+        loss_dict[f"{step}/loss"] = loss
+        loss_dict[f"{step}/ce_loss"] = ce_loss
+        loss_dict[f"{step}/loss_mean"] = loss / len(losses)
+        loss_dict[f"{step}/ce_loss_mean"] = ce_loss / len(ce_losses)
+        return loss, loss_dict
+
     def sequential_denoising_training_step(
         self,
         pixel_values: torch.Tensor,
@@ -1418,38 +1529,89 @@ class ViTDBlockModel(ViTModel):
             sigma = self.sigmas[step_index] * s_in
             block_idx = self.estimate_target_layer(sigma)
             logits = self.denoise(pixel_values, z, sigma, block_idx=block_idx)
-            per_example_loss = F.cross_entropy(
-                logits.view(-1, self.num_labels),
+            self.append_denoising_loss(
+                logits,
                 labels,
-                reduction="none",
+                sigma,
+                losses,
+                ce_losses,
+                loss_dict,
+                log_prefix=step,
+                step_index=step_index,
+                block_idx=block_idx,
             )
-            ce_loss = per_example_loss.mean()
-            weighted_loss = (per_example_loss * self.get_weights(sigma)).mean()
-            losses.append(weighted_loss)
-            ce_losses.append(ce_loss)
-            loss_dict[f"{step}/loss_step_{step_index}"] = weighted_loss
-            loss_dict[f"{step}/ce_loss_step_{step_index}"] = ce_loss
-            loss_dict[f"{step}/loss_block_{block_idx}"] = weighted_loss
-            loss_dict[f"{step}/ce_loss_block_{block_idx}"] = ce_loss
-            loss_dict[f"{step}/loss_{block_idx}"] = weighted_loss
-            loss_dict[f"{step}/ce_loss_{block_idx}"] = ce_loss
 
             if step_index == self.sigmas.shape[0] - 1:
                 continue
 
             next_sigma = self.sigmas[step_index + 1] * s_in
-            denoised = self.denoised_embedding_from_logits(logits)
-            d = (z - denoised) / sigma[:, None]
-            z = z + (next_sigma - sigma)[:, None] * d
-            z = z.detach()
+            z = self.euler_update(z, logits, sigma, next_sigma)
 
-        loss = torch.stack(losses).sum()
-        ce_loss = torch.stack(ce_losses).sum()
-        loss_dict[f"{step}/loss"] = loss
-        loss_dict[f"{step}/ce_loss"] = ce_loss
-        loss_dict[f"{step}/loss_mean"] = loss / len(losses)
-        loss_dict[f"{step}/ce_loss_mean"] = ce_loss / len(ce_losses)
-        return loss, loss_dict
+        return self.aggregate_denoising_losses(losses, ce_losses, loss_dict, step)
+
+    def hybrid_block0_independent_training_step(
+        self,
+        pixel_values: torch.Tensor,
+        labels: torch.Tensor,
+        step: str = "train",
+    ):
+        batch_size = pixel_values.shape[0]
+        labels = labels.view(-1)
+        z_clean = self.get_embeds(labels, is_input=True)
+        s_in = pixel_values.new_ones([batch_size])
+
+        sigma = self.get_sigmas_for_target_block(batch_size, target_block_idx=0).to(
+            z_clean
+        )
+        z = z_clean + sigma[:, None] * self.sample_epsilon_like(z_clean)
+
+        losses = []
+        ce_losses = []
+        loss_dict = {}
+
+        block_idx = 0
+        logits = self.denoise(pixel_values, z, sigma, block_idx=block_idx)
+        self.append_denoising_loss(
+            logits,
+            labels,
+            sigma,
+            losses,
+            ce_losses,
+            loss_dict,
+            log_prefix=step,
+            step_index=0,
+            block_idx=block_idx,
+            broadcast_weights=True,
+        )
+        loss_dict[f"{step}/hybrid_block0_sigma_mean"] = sigma.mean()
+
+        if self.sigmas.shape[0] > 1:
+            next_sigma = self.sigmas[1] * s_in
+            z = self.euler_update(z, logits, sigma, next_sigma)
+
+        for step_index in range(1, self.sigmas.shape[0]):
+            sigma = self.sigmas[step_index] * s_in
+            block_idx = self.estimate_target_layer(sigma)
+            logits = self.denoise(pixel_values, z, sigma, block_idx=block_idx)
+            self.append_denoising_loss(
+                logits,
+                labels,
+                sigma,
+                losses,
+                ce_losses,
+                loss_dict,
+                log_prefix=step,
+                step_index=step_index,
+                block_idx=block_idx,
+            )
+
+            if step_index == self.sigmas.shape[0] - 1:
+                continue
+
+            next_sigma = self.sigmas[step_index + 1] * s_in
+            z = self.euler_update(z, logits, sigma, next_sigma)
+
+        return self.aggregate_denoising_losses(losses, ce_losses, loss_dict, step)
 
     def diffusion_step(self, x, return_intermediates: bool = False):
         outputs = None
