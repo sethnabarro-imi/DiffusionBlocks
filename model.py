@@ -338,6 +338,9 @@ class ViTModel(L.LightningModule):
         self.args = args
         self.image_size = args.image_size
         self.num_labels = args.num_labels
+        self.classification_loss_type = getattr(
+            args, "classification_loss_type", "cross_entropy"
+        )
         self.valid_metrics = self.build_eval_metrics("val/")
         self.train_eval_metrics = self.build_eval_metrics("train_eval/")
         self.test_metrics = self.build_eval_metrics("test/")
@@ -395,6 +398,26 @@ class ViTModel(L.LightningModule):
     def forward(self, **kwargs):
         return self.model(**kwargs).logits
 
+    def per_example_classification_loss(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        *,
+        loss_type: str | None = None,
+    ) -> torch.Tensor:
+        loss_type = loss_type or self.classification_loss_type
+        logits = logits.view(-1, self.num_labels)
+        labels = labels.view(-1)
+        if loss_type == "cross_entropy":
+            return F.cross_entropy(logits, labels, reduction="none")
+        if loss_type == "one_hot_mse":
+            targets = F.one_hot(labels, num_classes=self.num_labels).to(logits)
+            return F.mse_loss(logits, targets, reduction="none").mean(dim=-1)
+        raise ValueError(f"Unsupported classification loss type: {loss_type}")
+
+    def classification_loss(self, logits: torch.Tensor, labels: torch.Tensor):
+        return self.per_example_classification_loss(logits, labels).mean()
+
     def shared_step(self, batch, step="train", return_metrics=False, **kwargs):
         pixel_values = batch["pixel_values"]
         labels = batch["labels"]
@@ -411,8 +434,13 @@ class ViTModel(L.LightningModule):
             else:
                 raise NotImplementedError(f"Step {step} is not supported")
 
-        loss = F.cross_entropy(logits.view(-1, self.num_labels), labels.view(-1))
+        loss = self.classification_loss(logits, labels)
         loss_dict = {f"{step}/loss": loss}
+        if self.classification_loss_type != "cross_entropy":
+            ce_loss = self.per_example_classification_loss(
+                logits, labels, loss_type="cross_entropy"
+            ).mean()
+            loss_dict[f"{step}/ce_loss"] = ce_loss
         return loss, loss_dict
 
     def get_model_kwargs(self, batch):
@@ -587,6 +615,7 @@ class ViTDBlockModel(ViTModel):
                 "num_inference_steps": self.num_inference_steps,
                 "num_prediction_samples": self.num_prediction_samples,
                 "prediction_average": self.prediction_average,
+                "classification_loss_type": self.classification_loss_type,
                 "sequential_denoising_training": (
                     self.sequential_denoising_training
                 ),
@@ -1425,12 +1454,15 @@ class ViTDBlockModel(ViTModel):
         sigmas = sigmas.to(z)
         zt = z + sigmas[:, None] * self.sample_epsilon_like(z)
         logits = self.denoise(pixel_values, zt, sigmas, block_idx)
-        loss = F.cross_entropy(
-            logits.view(-1, self.num_labels), labels.view(-1), reduction="none"
+        per_example_loss = self.per_example_classification_loss(logits, labels)
+        ce_per_example_loss = self.per_example_classification_loss(
+            logits, labels, loss_type="cross_entropy"
         )
-        ce_loss = loss.mean()
-        w = self.get_weights(sigmas)[:, None]
-        loss = (loss * w).mean()
+        ce_loss = ce_per_example_loss.mean()
+        w = self.get_weights(sigmas)
+        if self.classification_loss_type == "cross_entropy":
+            w = w[:, None]
+        loss = (per_example_loss * w).mean()
 
         loss_dict = {
             f"{step}/loss": loss,
@@ -1438,6 +1470,12 @@ class ViTDBlockModel(ViTModel):
             f"{step}/ce_loss": ce_loss,
             f"{step}/ce_loss_{block_idx}": ce_loss,
         }
+        if self.classification_loss_type != "cross_entropy":
+            raw_loss = per_example_loss.mean()
+            loss_dict[f"{step}/{self.classification_loss_type}"] = raw_loss
+            loss_dict[f"{step}/{self.classification_loss_type}_{block_idx}"] = (
+                raw_loss
+            )
         return loss, loss_dict
 
     def denoised_embedding_from_logits(self, logits: torch.Tensor) -> torch.Tensor:
@@ -1458,14 +1496,14 @@ class ViTDBlockModel(ViTModel):
         block_idx: int,
         broadcast_weights: bool = False,
     ) -> None:
-        per_example_loss = F.cross_entropy(
-            logits.view(-1, self.num_labels),
-            labels,
-            reduction="none",
+        per_example_loss = self.per_example_classification_loss(logits, labels)
+        ce_per_example_loss = self.per_example_classification_loss(
+            logits, labels, loss_type="cross_entropy"
         )
-        ce_loss = per_example_loss.mean()
+        ce_loss = ce_per_example_loss.mean()
+        raw_loss = per_example_loss.mean()
         weights = self.get_weights(sigmas)
-        if broadcast_weights:
+        if broadcast_weights and self.classification_loss_type == "cross_entropy":
             weights = weights[:, None]
         weighted_loss = (per_example_loss * weights).mean()
         losses.append(weighted_loss)
@@ -1476,6 +1514,11 @@ class ViTDBlockModel(ViTModel):
         loss_dict[f"{log_prefix}/ce_loss_block_{block_idx}"] = ce_loss
         loss_dict[f"{log_prefix}/loss_{block_idx}"] = weighted_loss
         loss_dict[f"{log_prefix}/ce_loss_{block_idx}"] = ce_loss
+        if self.classification_loss_type != "cross_entropy":
+            loss_name = self.classification_loss_type
+            loss_dict[f"{log_prefix}/{loss_name}_step_{step_index}"] = raw_loss
+            loss_dict[f"{log_prefix}/{loss_name}_block_{block_idx}"] = raw_loss
+            loss_dict[f"{log_prefix}/{loss_name}_{block_idx}"] = raw_loss
 
     def euler_update(
         self,

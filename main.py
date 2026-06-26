@@ -170,6 +170,9 @@ def write_eval_results(args, data, logdir, ckpt_path, split_results):
         "ece_num_bins": args.ece_num_bins,
         "input_noise_std": args.input_noise_std,
         "epsilon_seed": args.epsilon_seed,
+        "classification_loss_type": getattr(
+            args, "classification_loss_type", "cross_entropy"
+        ),
         "num_prediction_samples": args.num_prediction_samples,
         "prediction_average": args.prediction_average,
         "sequential_denoising_training": getattr(
@@ -301,6 +304,9 @@ def write_blockwise_training_eval_results(
         "ece_num_bins": args.ece_num_bins,
         "input_noise_std": args.input_noise_std,
         "epsilon_seed": args.epsilon_seed,
+        "classification_loss_type": getattr(
+            args, "classification_loss_type", "cross_entropy"
+        ),
         "num_prediction_samples": args.num_prediction_samples,
         "prediction_average": args.prediction_average,
         "sequential_denoising_training": getattr(
@@ -551,6 +557,18 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--optimizer", type=str, default="adamw")
+    parser.add_argument(
+        "--classification_loss_type",
+        type=str,
+        default="cross_entropy",
+        choices=["cross_entropy", "one_hot_mse"],
+        help=(
+            "classification loss used for training. cross_entropy keeps the "
+            "current logit CE objective; one_hot_mse treats the class-vector "
+            "output as a direct one-hot prediction and applies MSE to the true "
+            "one-hot label"
+        ),
+    )
     parser.add_argument("--num_warmup_steps", type=int, default=0)
     parser.add_argument("--deepspeed", action="store_true", help="use deepspeed")
     parser.add_argument("--seed", type=int, default=42)
