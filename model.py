@@ -1479,8 +1479,11 @@ class ViTDBlockModel(ViTModel):
         return loss, loss_dict
 
     def denoised_embedding_from_logits(self, logits: torch.Tensor) -> torch.Tensor:
-        probs = F.softmax(logits, dim=1)
-        return F.linear(probs, self.model.get_input_embeddings().weight.t())
+        if self.classification_loss_type == "one_hot_mse":
+            weights = logits
+        else:
+            weights = F.softmax(logits, dim=1)
+        return F.linear(weights, self.model.get_input_embeddings().weight.t())
 
     def append_denoising_loss(
         self,
