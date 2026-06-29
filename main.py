@@ -173,6 +173,7 @@ def write_eval_results(args, data, logdir, ckpt_path, split_results):
         "classification_loss_type": getattr(
             args, "classification_loss_type", "cross_entropy"
         ),
+        "one_hot_mse_top_k": getattr(args, "one_hot_mse_top_k", None),
         "num_prediction_samples": args.num_prediction_samples,
         "prediction_average": args.prediction_average,
         "sequential_denoising_training": getattr(
@@ -307,6 +308,7 @@ def write_blockwise_training_eval_results(
         "classification_loss_type": getattr(
             args, "classification_loss_type", "cross_entropy"
         ),
+        "one_hot_mse_top_k": getattr(args, "one_hot_mse_top_k", None),
         "num_prediction_samples": args.num_prediction_samples,
         "prediction_average": args.prediction_average,
         "sequential_denoising_training": getattr(
@@ -419,6 +421,13 @@ def validate_args(args):
             raise ValueError(f"--{key} must be between 0 and 1")
     if args.blockwise_eval_every_n_epochs < 0:
         raise ValueError("--blockwise_eval_every_n_epochs must be non-negative")
+    if args.one_hot_mse_top_k is not None:
+        if args.one_hot_mse_top_k < 0:
+            raise ValueError("--one_hot_mse_top_k must be non-negative")
+        if args.classification_loss_type != "one_hot_mse":
+            raise ValueError(
+                "--one_hot_mse_top_k requires --classification_loss_type one_hot_mse"
+            )
     if args.blockwise_eval_every_n_epochs > 0 and args.model_type != "dblock":
         raise ValueError("--blockwise_eval_every_n_epochs is only supported for dblock")
     if args.trace_oracle_noise_predictions and args.model_type != "dblock":
@@ -567,6 +576,16 @@ if __name__ == "__main__":
             "current logit CE objective; one_hot_mse treats the class-vector "
             "output as a direct one-hot prediction and applies MSE to the true "
             "one-hot label"
+        ),
+    )
+    parser.add_argument(
+        "--one_hot_mse_top_k",
+        type=int,
+        default=None,
+        help=(
+            "if set with --classification_loss_type one_hot_mse, compute MSE "
+            "only over the union of the true class and the top-N raw predicted "
+            "class outputs; unset keeps full-vector one-hot MSE"
         ),
     )
     parser.add_argument("--num_warmup_steps", type=int, default=0)

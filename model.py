@@ -341,6 +341,12 @@ class ViTModel(L.LightningModule):
         self.classification_loss_type = getattr(
             args, "classification_loss_type", "cross_entropy"
         )
+        self.one_hot_mse_top_k = getattr(args, "one_hot_mse_top_k", None)
+        if self.one_hot_mse_top_k is not None:
+            if self.one_hot_mse_top_k < 0:
+                raise ValueError("--one_hot_mse_top_k must be non-negative")
+            if self.one_hot_mse_top_k > self.num_labels:
+                raise ValueError("--one_hot_mse_top_k cannot exceed num_labels")
         self.valid_metrics = self.build_eval_metrics("val/")
         self.train_eval_metrics = self.build_eval_metrics("train_eval/")
         self.test_metrics = self.build_eval_metrics("test/")
@@ -412,7 +418,21 @@ class ViTModel(L.LightningModule):
             return F.cross_entropy(logits, labels, reduction="none")
         if loss_type == "one_hot_mse":
             targets = F.one_hot(labels, num_classes=self.num_labels).to(logits)
-            return F.mse_loss(logits, targets, reduction="none").mean(dim=-1)
+            per_class_loss = F.mse_loss(logits, targets, reduction="none")
+            if self.one_hot_mse_top_k is None:
+                return per_class_loss.mean(dim=-1)
+
+            mask = torch.zeros_like(per_class_loss, dtype=torch.bool)
+            if self.one_hot_mse_top_k > 0:
+                top_indices = logits.detach().topk(
+                    self.one_hot_mse_top_k,
+                    dim=-1,
+                ).indices
+                mask.scatter_(dim=-1, index=top_indices, value=True)
+            mask.scatter_(dim=-1, index=labels[:, None], value=True)
+            selected_loss = per_class_loss.masked_fill(~mask, 0.0).sum(dim=-1)
+            selected_count = mask.sum(dim=-1).clamp_min(1)
+            return selected_loss / selected_count
         raise ValueError(f"Unsupported classification loss type: {loss_type}")
 
     def classification_loss(self, logits: torch.Tensor, labels: torch.Tensor):
@@ -616,6 +636,7 @@ class ViTDBlockModel(ViTModel):
                 "num_prediction_samples": self.num_prediction_samples,
                 "prediction_average": self.prediction_average,
                 "classification_loss_type": self.classification_loss_type,
+                "one_hot_mse_top_k": self.one_hot_mse_top_k,
                 "sequential_denoising_training": (
                     self.sequential_denoising_training
                 ),
