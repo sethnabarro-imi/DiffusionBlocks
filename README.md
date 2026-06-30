@@ -98,6 +98,104 @@ srun uv run main.py train cifar100 \
 
 </details>
 
+### Synthetic teacher experiments
+
+For a minimal controlled task, use `synthetic-teacher`. Inputs are sampled as
+Gaussian vectors, padded into `3 x 32 x 32` tensors for the existing ViT/DBlock
+model, and labeled by a frozen random MLP teacher. Synthetic runs write JSON
+diagnostics under `logs/<run-name>/`, but checkpointing and W&B logging are off
+by default.
+
+```bash
+uv run main.py train synthetic-teacher \
+    --model_type dblock \
+    --num_blocks 6 \
+    --num_hidden_layers 12 \
+    --num_epochs 50 \
+    --batch_size 128 \
+    --synthetic_num_train 4096 \
+    --synthetic_num_test 2048 \
+    --synthetic_input_dim 128 \
+    --synthetic_num_classes 10 \
+    --synthetic_teacher_depth 3 \
+    --synthetic_teacher_width 256 \
+    --sequential_denoising_training \
+    --trace_oracle_noise_predictions \
+    --blockwise_eval_every_n_epochs 10 \
+    --postfix=-synthetic-teacher
+```
+
+To compare categorical cross-entropy with a one-hot MSE likelihood, add:
+
+```bash
+--classification_loss_type one_hot_mse
+```
+
+For continuous teacher targets, switch the target type and set the output
+dimension:
+
+```bash
+uv run main.py train synthetic-teacher \
+    --model_type dblock \
+    --synthetic_target_type continuous \
+    --synthetic_target_dim 8 \
+    --num_blocks 6 \
+    --num_hidden_layers 12 \
+    --num_epochs 50 \
+    --sequential_denoising_training \
+    --trace_oracle_noise_predictions \
+    --blockwise_eval_every_n_epochs 10 \
+    --postfix=-synthetic-regression
+```
+
+To opt back into heavier training artifacts for synthetic runs, add:
+
+```bash
+--synthetic_enable_checkpointing --synthetic_enable_wandb
+```
+
+After training, turn a blockwise eval JSON file into a CSV and accuracy plot:
+
+```bash
+uv run scripts/plot_blockwise_eval.py \
+    logs/<run-name>/blockwise_eval_epoch_00050.json
+```
+
+### Toy 1D regression DBlock
+
+For a very small local diagnostic that does not use Lightning, W&B,
+checkpoints, images, or the ViT code path, run:
+
+```bash
+uv run python toy_1d_regression_dblock.py \
+    --epochs 1000 \
+    --num_blocks 6 \
+    --num_train 512 \
+    --num_test 512 \
+    --observation_noise_std 0.0
+```
+
+This trains a tiny DBlock-style denoising chain on a 1D synthetic regression
+task and writes:
+
+```text
+results/toy_1d_regression/<timestamp>/config.json
+results/toy_1d_regression/<timestamp>/metrics.json
+results/toy_1d_regression/<timestamp>/blockwise_metrics.csv
+results/toy_1d_regression/<timestamp>/blockwise_rmse.png
+results/toy_1d_regression/<timestamp>/predictions_by_block.png
+results/toy_1d_regression/<timestamp>/test_rmse_by_block_eval_cycles.csv
+results/toy_1d_regression/<timestamp>/test_rmse_by_block_eval_cycles.png
+results/toy_1d_regression/<timestamp>/train_loss_by_block_eval_cycles.csv
+results/toy_1d_regression/<timestamp>/train_loss_by_block_eval_cycles.png
+results/toy_1d_regression/<timestamp>/train_loss_by_block_eval_cycles.svg
+results/toy_1d_regression/<timestamp>/prediction_curves_by_block_eval_cycles.csv
+results/toy_1d_regression/<timestamp>/prediction_curves_by_block_eval_cycles.png
+```
+
+Use `--observation_noise_std` to add Gaussian observation noise to both train
+and test targets. The old `--target_noise_std` name is kept as an alias.
+
 ## Evaluation
 
 **Baseline (ViT):**

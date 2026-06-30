@@ -110,6 +110,176 @@ class MulticlassLogLikelihood(torchmetrics.Metric):
         return self.log_likelihood_sum / self.count.clamp_min(1)
 
 
+class RegressionExplainedVariance(torchmetrics.Metric):
+    higher_is_better = True
+    full_state_update = False
+
+    def __init__(self):
+        super().__init__()
+        self.add_state("sse", default=torch.tensor(0.0), dist_reduce_fx="sum")
+        self.add_state("target_sum", default=torch.tensor(0.0), dist_reduce_fx="sum")
+        self.add_state(
+            "target_sq_sum", default=torch.tensor(0.0), dist_reduce_fx="sum"
+        )
+        self.add_state("count", default=torch.tensor(0.0), dist_reduce_fx="sum")
+
+    def update(self, preds: torch.Tensor, targets: torch.Tensor) -> None:
+        preds = preds.float().view(targets.shape)
+        targets = targets.float()
+        residual = preds - targets
+        self.sse += residual.square().sum()
+        self.target_sum += targets.sum()
+        self.target_sq_sum += targets.square().sum()
+        self.count += targets.numel()
+
+    def compute(self) -> torch.Tensor:
+        variance_sum = self.target_sq_sum - self.target_sum.square() / self.count.clamp_min(1)
+        return 1.0 - self.sse / variance_sum.clamp_min(torch.finfo(self.sse.dtype).tiny)
+
+
+class DBlockRegressionPredictionMetric(torchmetrics.Metric):
+    higher_is_better = None
+    full_state_update = False
+
+    def __init__(self, num_steps: int):
+        super().__init__()
+        self.num_steps = num_steps
+        self.add_state("count", default=torch.zeros(num_steps), dist_reduce_fx="sum")
+        self.add_state("mse_sum", default=torch.zeros(num_steps), dist_reduce_fx="sum")
+        self.add_state("mae_sum", default=torch.zeros(num_steps), dist_reduce_fx="sum")
+        self.add_state(
+            "final_mse_sum", default=torch.zeros(num_steps), dist_reduce_fx="sum"
+        )
+        self.add_state(
+            "changed_from_prev_sum",
+            default=torch.zeros(num_steps),
+            dist_reduce_fx="sum",
+        )
+        self.add_state(
+            "block_index_sum", default=torch.zeros(num_steps), dist_reduce_fx="sum"
+        )
+        self.add_state("sigma_sum", default=torch.zeros(num_steps), dist_reduce_fx="sum")
+        self.add_state(
+            "metadata_count", default=torch.zeros(num_steps), dist_reduce_fx="sum"
+        )
+        self.add_state(
+            "denoise_step_index_sum",
+            default=torch.zeros(num_steps),
+            dist_reduce_fx="sum",
+        )
+        self.add_state(
+            "layer_index_sum", default=torch.zeros(num_steps), dist_reduce_fx="sum"
+        )
+        self.add_state(
+            "layer_position_sum", default=torch.zeros(num_steps), dist_reduce_fx="sum"
+        )
+        self.add_state(
+            "layers_in_block_sum", default=torch.zeros(num_steps), dist_reduce_fx="sum"
+        )
+
+    def update(
+        self,
+        step_predictions: torch.Tensor,
+        targets: torch.Tensor,
+        block_indices: torch.Tensor,
+        sigmas: torch.Tensor,
+        denoise_step_indices: torch.Tensor | None = None,
+        layer_indices: torch.Tensor | None = None,
+        layer_positions: torch.Tensor | None = None,
+        layers_in_block: torch.Tensor | None = None,
+    ) -> None:
+        if step_predictions.ndim != 3:
+            raise ValueError(
+                "step_predictions must have shape [num_steps, batch_size, target_dim]"
+            )
+        if step_predictions.shape[0] != self.num_steps:
+            raise ValueError(
+                f"Expected {self.num_steps} traced steps, got {step_predictions.shape[0]}"
+            )
+        targets = targets.float()
+        predictions = step_predictions.float()
+        if targets.ndim == 1:
+            targets = targets[:, None]
+        if predictions.shape[1:] != targets.shape:
+            raise ValueError(
+                f"Prediction shape {predictions.shape[1:]} does not match target shape {targets.shape}"
+            )
+
+        squared_error = (predictions - targets[None, :, :]).square().mean(dim=-1)
+        absolute_error = (predictions - targets[None, :, :]).abs().mean(dim=-1)
+        final_squared_error = (predictions - predictions[-1][None, :, :]).square().mean(
+            dim=-1
+        )
+        changed_from_prev = torch.zeros_like(squared_error)
+        if self.num_steps > 1:
+            changed_from_prev[1:] = (
+                predictions[1:] - predictions[:-1]
+            ).square().mean(dim=-1)
+
+        batch_size = targets.shape[0]
+        self.count += torch.full_like(self.count, batch_size)
+        self.mse_sum += squared_error.sum(dim=1)
+        self.mae_sum += absolute_error.sum(dim=1)
+        self.final_mse_sum += final_squared_error.sum(dim=1)
+        self.changed_from_prev_sum += changed_from_prev.sum(dim=1)
+
+        block_indices = block_indices.to(self.block_index_sum.device).float()
+        sigmas = sigmas.to(self.sigma_sum.device).float()
+        if denoise_step_indices is None:
+            denoise_step_indices = torch.arange(
+                self.num_steps,
+                device=self.denoise_step_index_sum.device,
+                dtype=torch.float32,
+            )
+        else:
+            denoise_step_indices = denoise_step_indices.to(
+                self.denoise_step_index_sum.device
+            ).float()
+        if layer_indices is None:
+            layer_indices = torch.full_like(self.layer_index_sum, -1.0)
+        else:
+            layer_indices = layer_indices.to(self.layer_index_sum.device).float()
+        if layer_positions is None:
+            layer_positions = torch.full_like(self.layer_position_sum, -1.0)
+        else:
+            layer_positions = layer_positions.to(
+                self.layer_position_sum.device
+            ).float()
+        if layers_in_block is None:
+            layers_in_block = torch.zeros_like(self.layers_in_block_sum)
+        else:
+            layers_in_block = layers_in_block.to(
+                self.layers_in_block_sum.device
+            ).float()
+
+        self.block_index_sum += block_indices
+        self.sigma_sum += sigmas
+        self.denoise_step_index_sum += denoise_step_indices
+        self.layer_index_sum += layer_indices
+        self.layer_position_sum += layer_positions
+        self.layers_in_block_sum += layers_in_block
+        self.metadata_count += torch.ones_like(self.metadata_count)
+
+    def compute(self) -> dict[str, torch.Tensor]:
+        safe_count = self.count.clamp_min(1)
+        safe_metadata_count = self.metadata_count.clamp_min(1)
+        mse = self.mse_sum / safe_count
+        return {
+            "count": self.count,
+            "denoise_step_index": self.denoise_step_index_sum / safe_metadata_count,
+            "block_index": self.block_index_sum / safe_metadata_count,
+            "layer_index": self.layer_index_sum / safe_metadata_count,
+            "layer_position": self.layer_position_sum / safe_metadata_count,
+            "layers_in_block": self.layers_in_block_sum / safe_metadata_count,
+            "sigma": self.sigma_sum / safe_metadata_count,
+            "mse": mse,
+            "rmse": mse.clamp_min(0).sqrt(),
+            "mae": self.mae_sum / safe_count,
+            "final_mse": self.final_mse_sum / safe_count,
+            "changed_from_previous_mse": self.changed_from_prev_sum / safe_count,
+        }
+
+
 class DBlockIntermediatePredictionMetric(torchmetrics.Metric):
     higher_is_better = None
     full_state_update = False
@@ -338,6 +508,7 @@ class ViTModel(L.LightningModule):
         self.args = args
         self.image_size = args.image_size
         self.num_labels = args.num_labels
+        self.task_type = getattr(args, "task_type", "classification")
         self.classification_loss_type = getattr(
             args, "classification_loss_type", "cross_entropy"
         )
@@ -362,6 +533,15 @@ class ViTModel(L.LightningModule):
         }
 
     def build_eval_metrics(self, prefix: str):
+        if self.task_type == "regression":
+            return torchmetrics.MetricCollection(
+                {
+                    "mse": torchmetrics.MeanSquaredError(),
+                    "mae": torchmetrics.MeanAbsoluteError(),
+                    "explained_variance": RegressionExplainedVariance(),
+                },
+                prefix=prefix,
+            )
         return torchmetrics.MetricCollection(
             {
                 "acc": torchmetrics.Accuracy(
@@ -387,8 +567,9 @@ class ViTModel(L.LightningModule):
             self.model.gradient_checkpointing_enable()
 
     def configure_optimizers(self):
+        parameters = [p for p in self.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(
-            self.model.parameters(),
+            parameters,
             lr=self.args.lr,
             weight_decay=self.args.weight_decay,
         )
@@ -438,27 +619,46 @@ class ViTModel(L.LightningModule):
     def classification_loss(self, logits: torch.Tensor, labels: torch.Tensor):
         return self.per_example_classification_loss(logits, labels).mean()
 
+    def per_example_regression_loss(
+        self,
+        predictions: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> torch.Tensor:
+        predictions = predictions.view(-1, self.num_labels)
+        targets = targets.float().view(-1, self.num_labels)
+        return F.mse_loss(predictions, targets, reduction="none").mean(dim=-1)
+
+    def regression_loss(self, predictions: torch.Tensor, targets: torch.Tensor):
+        return self.per_example_regression_loss(predictions, targets).mean()
+
     def shared_step(self, batch, step="train", return_metrics=False, **kwargs):
         pixel_values = batch["pixel_values"]
         labels = batch["labels"]
-        logits = self(pixel_values=pixel_values, **kwargs)
+        predictions = self(pixel_values=pixel_values, **kwargs)
         if return_metrics:
-            logits = logits.view(-1, self.num_labels)
-            labels = labels.view(-1)
+            predictions = predictions.view(-1, self.num_labels)
+            if self.task_type == "regression":
+                labels = labels.float().view(-1, self.num_labels)
+            else:
+                labels = labels.view(-1)
             if step == "val":
-                return self.valid_metrics(logits, labels)
+                return self.valid_metrics(predictions, labels)
             elif step == "train_eval":
-                return self.train_eval_metrics(logits, labels)
+                return self.train_eval_metrics(predictions, labels)
             elif step == "test":
-                return self.test_metrics(logits, labels)
+                return self.test_metrics(predictions, labels)
             else:
                 raise NotImplementedError(f"Step {step} is not supported")
 
-        loss = self.classification_loss(logits, labels)
+        if self.task_type == "regression":
+            loss = self.regression_loss(predictions, labels)
+            return loss, {f"{step}/loss": loss, f"{step}/mse": loss}
+
+        loss = self.classification_loss(predictions, labels)
         loss_dict = {f"{step}/loss": loss}
         if self.classification_loss_type != "cross_entropy":
             ce_loss = self.per_example_classification_loss(
-                logits, labels, loss_type="cross_entropy"
+                predictions, labels, loss_type="cross_entropy"
             ).mean()
             loss_dict[f"{step}/ce_loss"] = ce_loss
         return loss, loss_dict
@@ -499,9 +699,10 @@ class ViTModel(L.LightningModule):
             split_results[self.strip_metric_prefix(metric_name)] = value
 
         calibration_metric = self.get_calibration_metric(self.eval_split)
-        with calibration_metric.sync_context():
-            stats = calibration_metric.calibration_stats()
-            split_results["ece_bins"] = self.calibration_rows(stats)
+        if calibration_metric is not None:
+            with calibration_metric.sync_context():
+                stats = calibration_metric.calibration_stats()
+                split_results["ece_bins"] = self.calibration_rows(stats)
 
         if self.trainer.is_global_zero:
             self.eval_results_by_split[self.eval_split] = split_results
@@ -519,7 +720,7 @@ class ViTModel(L.LightningModule):
         for metric in self.get_eval_metrics(split).values():
             if isinstance(metric, ExpectedCalibrationError):
                 return metric
-        raise RuntimeError(f"No calibration metric configured for {split}")
+        return None
 
     def strip_metric_prefix(self, metric_name: str) -> str:
         prefix = f"{self.eval_split}/"
@@ -570,6 +771,24 @@ class ViTDBlockModel(ViTModel):
         self.hybrid_block0_independent_training = getattr(
             self.args, "hybrid_block0_independent_training", False
         )
+        self.dblock_training_objective = getattr(
+            self.args, "dblock_training_objective", "classification"
+        )
+        if self.dblock_training_objective not in [
+            "classification",
+            "residual_next_latent",
+        ]:
+            raise ValueError(
+                f"Unsupported DBlock training objective: {self.dblock_training_objective}"
+            )
+        if (
+            self.dblock_training_objective == "residual_next_latent"
+            and self.task_type != "classification"
+        ):
+            raise ValueError(
+                "--dblock_training_objective residual_next_latent currently "
+                "requires classification targets"
+            )
         self.trace_block_layers = getattr(self.args, "trace_block_layers", False)
         self.trace_intermediate_predictions = (
             getattr(self.args, "trace_intermediate_predictions", False)
@@ -588,15 +807,20 @@ class ViTDBlockModel(ViTModel):
             raise ValueError("--trace_prediction_examples must be non-negative")
         self.block_sigmas = get_block_sigmas(num_layers=self.args.num_blocks)
         self.layer_assignment = None
+        intermediate_metric_cls = (
+            DBlockRegressionPredictionMetric
+            if self.task_type == "regression"
+            else DBlockIntermediatePredictionMetric
+        )
         self.intermediate_prediction_metrics = torch.nn.ModuleDict(
             {
-                split: DBlockIntermediatePredictionMetric(self.num_inference_steps)
+                split: intermediate_metric_cls(self.num_inference_steps)
                 for split in ["val", "train_eval", "test"]
             }
         )
         self.oracle_noise_prediction_metrics = torch.nn.ModuleDict(
             {
-                split: DBlockIntermediatePredictionMetric(self.num_inference_steps)
+                split: intermediate_metric_cls(self.num_inference_steps)
                 for split in ["val", "train_eval", "test"]
             }
         )
@@ -637,6 +861,7 @@ class ViTDBlockModel(ViTModel):
                 "prediction_average": self.prediction_average,
                 "classification_loss_type": self.classification_loss_type,
                 "one_hot_mse_top_k": self.one_hot_mse_top_k,
+                "dblock_training_objective": self.dblock_training_objective,
                 "sequential_denoising_training": (
                     self.sequential_denoising_training
                 ),
@@ -656,12 +881,20 @@ class ViTDBlockModel(ViTModel):
         )
 
     def configure_model(self):
+        architecture_kwargs = self.architecture_kwargs()
+        if self.dblock_training_objective == "residual_next_latent":
+            architecture_kwargs["latent_prediction_head"] = True
         self.model = load_vit(
             image_size=self.image_size,
             num_labels=self.num_labels,
             is_dblock=True,
-            **self.architecture_kwargs(),
+            **architecture_kwargs,
         )
+        if self.task_type == "regression":
+            self.regression_target_encoder = torch.nn.Linear(
+                self.num_labels,
+                self.model.config.hidden_size,
+            )
         self.build_layer_prediction_metrics()
         print(self.model)
 
@@ -682,15 +915,20 @@ class ViTDBlockModel(ViTModel):
 
     def build_layer_prediction_metrics(self):
         layer_points = self.num_inference_steps * self.layers_per_block()
+        metric_cls = (
+            DBlockRegressionPredictionMetric
+            if self.task_type == "regression"
+            else DBlockIntermediatePredictionMetric
+        )
         self.layer_prediction_metrics = torch.nn.ModuleDict(
             {
-                split: DBlockIntermediatePredictionMetric(layer_points)
+                split: metric_cls(layer_points)
                 for split in ["val", "train_eval", "test"]
             }
         )
         self.oracle_noise_layer_prediction_metrics = torch.nn.ModuleDict(
             {
-                split: DBlockIntermediatePredictionMetric(layer_points)
+                split: metric_cls(layer_points)
                 for split in ["val", "train_eval", "test"]
             }
         )
@@ -724,6 +962,12 @@ class ViTDBlockModel(ViTModel):
                 input_ids, weight=self.model.get_output_embeddings().weight
             )
         return self.normalize_embeddings(embeds)
+
+    def get_target_latents(self, targets: torch.Tensor) -> torch.Tensor:
+        if self.task_type == "classification":
+            return self.get_embeds(targets, is_input=True)
+        targets = targets.float().view(-1, self.num_labels)
+        return self.normalize_embeddings(self.regression_target_encoder(targets))
 
     def get_sigmas(self, n_samples: int, p_mean: float = -1.2, p_std: float = 1.2):
         block_idx = random.choices(range(self.args.num_blocks), k=1)[0]
@@ -831,6 +1075,16 @@ class ViTDBlockModel(ViTModel):
             return logits_uncond + self.cfg_scale * (logits_cond - logits_uncond)
         return logits
 
+    def uses_residual_next_latent_objective(self) -> bool:
+        return self.dblock_training_objective == "residual_next_latent"
+
+    def logits_from_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        label_embeddings = self.normalize_embeddings(
+            self.model.get_input_embeddings().weight
+        )
+        latent = self.normalize_embeddings(latent)
+        return F.linear(latent, label_embeddings)
+
     def pool_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.model.vit.layernorm(hidden_states)
         if self.model.config.pooling_type == "cls":
@@ -842,6 +1096,7 @@ class ViTDBlockModel(ViTModel):
     def denoise(self, x, zt, sigma, block_idx=None, return_layer_logits=False):
         if block_idx is None:
             block_idx = self.estimate_target_layer(sigma)
+        zt_for_update = zt
         if self.class_dropout_prob > 0.0 and self.training:
             drop_x = torch.rand(x.shape[0], device=x.device) < self.class_dropout_prob
             uncond_x = torch.zeros_like(x)
@@ -868,30 +1123,74 @@ class ViTDBlockModel(ViTModel):
         hidden_states = outputs.last_hidden_state
         conditioning = outputs.conditioning
         model_out = hidden_states * c_out[:, None] + zt * c_skip[:, None]
-        logits = self.model.forward_output_embeddings(
-            model_out.unsqueeze(1), conditioning
-        )
-        logits = self.apply_classifier_free_guidance(logits)
+        latent_delta = None
+        if self.uses_residual_next_latent_objective():
+            latent_delta = self.model.forward_latent_delta(
+                hidden_states.unsqueeze(1), conditioning
+            )
+            latent_delta = self.apply_classifier_free_guidance(latent_delta)
+            model_out = zt_for_update + latent_delta
+            logits = self.logits_from_latent(model_out)
+        else:
+            logits = self.model.forward_output_embeddings(
+                model_out.unsqueeze(1), conditioning
+            )
+            logits = self.apply_classifier_free_guidance(logits)
+        if self.task_type == "regression":
+            model_out = self.apply_classifier_free_guidance(model_out)
         if not return_layer_logits:
+            if self.task_type == "regression" or self.uses_residual_next_latent_objective():
+                if latent_delta is not None:
+                    return {
+                        "logits": logits,
+                        "latent": model_out,
+                        "latent_delta": latent_delta,
+                    }
+                return {"logits": logits, "latent": model_out}
             return logits
 
         layer_logits = []
+        layer_latents = []
+        layer_latent_deltas = []
         for layer_hidden_states in outputs.hidden_states[1:]:
             layer_hidden_states = self.pool_hidden_states(layer_hidden_states)
-            layer_model_out = (
-                layer_hidden_states * c_out[:, None] + zt * c_skip[:, None]
-            )
-            layer_logit = self.model.forward_output_embeddings(
-                layer_model_out.unsqueeze(1), conditioning
-            )
-            layer_logits.append(self.apply_classifier_free_guidance(layer_logit))
-        return {
+            if self.uses_residual_next_latent_objective():
+                layer_delta = self.model.forward_latent_delta(
+                    layer_hidden_states.unsqueeze(1), conditioning
+                )
+                layer_delta = self.apply_classifier_free_guidance(layer_delta)
+                layer_model_out = zt_for_update + layer_delta
+                layer_logit = self.logits_from_latent(layer_model_out)
+                layer_latent_deltas.append(layer_delta)
+            else:
+                layer_model_out = (
+                    layer_hidden_states * c_out[:, None] + zt * c_skip[:, None]
+                )
+                layer_logit = self.model.forward_output_embeddings(
+                    layer_model_out.unsqueeze(1), conditioning
+                )
+                layer_logit = self.apply_classifier_free_guidance(layer_logit)
+            layer_logits.append(layer_logit)
+            if self.task_type == "regression":
+                layer_latents.append(self.apply_classifier_free_guidance(layer_model_out))
+            elif self.uses_residual_next_latent_objective():
+                layer_latents.append(layer_model_out)
+        result = {
             "logits": logits,
             "layer_logits": torch.stack(layer_logits),
             "layer_indices": torch.tensor(
                 layer_indices, device=logits.device, dtype=torch.long
             ),
         }
+        if self.task_type == "regression":
+            result["latent"] = model_out
+            result["layer_latents"] = torch.stack(layer_latents)
+        if self.uses_residual_next_latent_objective():
+            result["latent"] = model_out
+            result["latent_delta"] = latent_delta
+            result["layer_latents"] = torch.stack(layer_latents)
+            result["layer_latent_deltas"] = torch.stack(layer_latent_deltas)
+        return result
 
     def on_test_epoch_start(self):
         super().on_test_epoch_start()
@@ -1001,29 +1300,47 @@ class ViTDBlockModel(ViTModel):
         rows = []
         for step_index in range(len(cpu_stats["count"])):
             block_index = round(cpu_stats["block_index"][step_index])
-            rows.append(
-                {
-                    "step_index": step_index,
-                    "block_index": int(block_index),
-                    "sigma": cpu_stats["sigma"][step_index],
-                    "count": int(cpu_stats["count"][step_index]),
-                    "accuracy_rate": cpu_stats["accuracy"][step_index],
-                    "confidence_rate": cpu_stats["confidence"][step_index],
-                    "true_probability": cpu_stats["true_probability"][step_index],
-                    "log_likelihood": cpu_stats["log_likelihood"][step_index],
-                    "entropy": cpu_stats["entropy"][step_index],
-                    "final_agreement_rate": cpu_stats["final_agreement"][step_index],
-                    "changed_from_previous_rate": cpu_stats[
-                        "changed_from_previous"
-                    ][step_index],
-                    "incorrect_to_correct_rate": cpu_stats[
-                        "incorrect_to_correct"
-                    ][step_index],
-                    "correct_to_incorrect_rate": cpu_stats[
-                        "correct_to_incorrect"
-                    ][step_index],
-                }
-            )
+            row = {
+                "step_index": step_index,
+                "block_index": int(block_index),
+                "sigma": cpu_stats["sigma"][step_index],
+                "count": int(cpu_stats["count"][step_index]),
+            }
+            if self.task_type == "regression":
+                row.update(
+                    {
+                        "mse": cpu_stats["mse"][step_index],
+                        "rmse": cpu_stats["rmse"][step_index],
+                        "mae": cpu_stats["mae"][step_index],
+                        "final_mse": cpu_stats["final_mse"][step_index],
+                        "changed_from_previous_mse": cpu_stats[
+                            "changed_from_previous_mse"
+                        ][step_index],
+                    }
+                )
+            else:
+                row.update(
+                    {
+                        "accuracy_rate": cpu_stats["accuracy"][step_index],
+                        "confidence_rate": cpu_stats["confidence"][step_index],
+                        "true_probability": cpu_stats["true_probability"][step_index],
+                        "log_likelihood": cpu_stats["log_likelihood"][step_index],
+                        "entropy": cpu_stats["entropy"][step_index],
+                        "final_agreement_rate": cpu_stats["final_agreement"][
+                            step_index
+                        ],
+                        "changed_from_previous_rate": cpu_stats[
+                            "changed_from_previous"
+                        ][step_index],
+                        "incorrect_to_correct_rate": cpu_stats[
+                            "incorrect_to_correct"
+                        ][step_index],
+                        "correct_to_incorrect_rate": cpu_stats[
+                            "correct_to_incorrect"
+                        ][step_index],
+                    }
+                )
+            rows.append(row)
         return rows
 
     def layer_prediction_rows(self, stats: dict[str, torch.Tensor]) -> list[dict]:
@@ -1038,33 +1355,53 @@ class ViTDBlockModel(ViTModel):
             layer_index = round(cpu_stats["layer_index"][event_index])
             layer_position = round(cpu_stats["layer_position"][event_index])
             layers_in_block = round(cpu_stats["layers_in_block"][event_index])
-            rows.append(
-                {
-                    "event_index": event_index,
-                    "denoise_step_index": int(denoise_step_index),
-                    "block_index": int(block_index),
-                    "layer_index": int(layer_index),
-                    "layer_position": int(layer_position),
-                    "layers_in_block": int(layers_in_block),
-                    "sigma": cpu_stats["sigma"][event_index],
-                    "count": int(cpu_stats["count"][event_index]),
-                    "accuracy_rate": cpu_stats["accuracy"][event_index],
-                    "confidence_rate": cpu_stats["confidence"][event_index],
-                    "true_probability": cpu_stats["true_probability"][event_index],
-                    "log_likelihood": cpu_stats["log_likelihood"][event_index],
-                    "entropy": cpu_stats["entropy"][event_index],
-                    "final_agreement_rate": cpu_stats["final_agreement"][event_index],
-                    "changed_from_previous_rate": cpu_stats[
-                        "changed_from_previous"
-                    ][event_index],
-                    "incorrect_to_correct_rate": cpu_stats[
-                        "incorrect_to_correct"
-                    ][event_index],
-                    "correct_to_incorrect_rate": cpu_stats[
-                        "correct_to_incorrect"
-                    ][event_index],
-                }
-            )
+            row = {
+                "event_index": event_index,
+                "denoise_step_index": int(denoise_step_index),
+                "block_index": int(block_index),
+                "layer_index": int(layer_index),
+                "layer_position": int(layer_position),
+                "layers_in_block": int(layers_in_block),
+                "sigma": cpu_stats["sigma"][event_index],
+                "count": int(cpu_stats["count"][event_index]),
+            }
+            if self.task_type == "regression":
+                row.update(
+                    {
+                        "mse": cpu_stats["mse"][event_index],
+                        "rmse": cpu_stats["rmse"][event_index],
+                        "mae": cpu_stats["mae"][event_index],
+                        "final_mse": cpu_stats["final_mse"][event_index],
+                        "changed_from_previous_mse": cpu_stats[
+                            "changed_from_previous_mse"
+                        ][event_index],
+                    }
+                )
+            else:
+                row.update(
+                    {
+                        "accuracy_rate": cpu_stats["accuracy"][event_index],
+                        "confidence_rate": cpu_stats["confidence"][event_index],
+                        "true_probability": cpu_stats["true_probability"][
+                            event_index
+                        ],
+                        "log_likelihood": cpu_stats["log_likelihood"][event_index],
+                        "entropy": cpu_stats["entropy"][event_index],
+                        "final_agreement_rate": cpu_stats["final_agreement"][
+                            event_index
+                        ],
+                        "changed_from_previous_rate": cpu_stats[
+                            "changed_from_previous"
+                        ][event_index],
+                        "incorrect_to_correct_rate": cpu_stats[
+                            "incorrect_to_correct"
+                        ][event_index],
+                        "correct_to_incorrect_rate": cpu_stats[
+                            "correct_to_incorrect"
+                        ][event_index],
+                    }
+                )
+            rows.append(row)
         return rows
 
     def record_intermediate_predictions(
@@ -1072,7 +1409,10 @@ class ViTDBlockModel(ViTModel):
         trace: dict[str, torch.Tensor],
         labels: torch.Tensor,
     ) -> None:
-        labels = labels.view(-1)
+        if self.task_type == "regression":
+            labels = labels.float().view(-1, self.num_labels)
+        else:
+            labels = labels.view(-1)
         self.get_intermediate_prediction_metric(self.eval_split).update(
             trace["logits"],
             labels,
@@ -1095,12 +1435,49 @@ class ViTDBlockModel(ViTModel):
         if not self.trainer.is_global_zero:
             return
 
-        if self.trace_block_layers and "layer_logits" in trace:
+        if (
+            self.trace_block_layers
+            and self.task_type == "classification"
+            and "layer_logits" in trace
+        ):
             self.record_layer_prediction_examples(trace, labels)
 
         examples = self.intermediate_prediction_examples_by_split[self.eval_split]
         remaining = self.trace_prediction_examples - len(examples)
         if remaining <= 0:
+            return
+
+        if self.task_type == "regression":
+            predictions = trace["logits"].float()
+            targets = labels.float()
+            block_indices = trace["block_indices"].detach().cpu().tolist()
+            sigmas = trace["sigmas"].detach().float().cpu().tolist()
+            squared_error = (predictions - targets[None, :, :]).square().mean(dim=-1)
+            for batch_index in range(min(remaining, labels.shape[0])):
+                steps = []
+                for step_index in range(predictions.shape[0]):
+                    steps.append(
+                        {
+                            "step_index": step_index,
+                            "block_index": int(block_indices[step_index]),
+                            "sigma": sigmas[step_index],
+                            "prediction": predictions[
+                                step_index, batch_index
+                            ].detach().cpu().tolist(),
+                            "mse": float(
+                                squared_error[
+                                    step_index, batch_index
+                                ].detach().cpu()
+                            ),
+                        }
+                    )
+                examples.append(
+                    {
+                        "example_index": len(examples),
+                        "target": targets[batch_index].detach().cpu().tolist(),
+                        "steps": steps,
+                    }
+                )
             return
 
         probs = F.softmax(trace["logits"].float(), dim=-1)
@@ -1151,7 +1528,10 @@ class ViTDBlockModel(ViTModel):
         trace: dict[str, torch.Tensor],
         labels: torch.Tensor,
     ) -> None:
-        labels = labels.view(-1)
+        if self.task_type == "regression":
+            labels = labels.float().view(-1, self.num_labels)
+        else:
+            labels = labels.view(-1)
         self.get_oracle_noise_prediction_metric(self.eval_split).update(
             trace["logits"],
             labels,
@@ -1241,8 +1621,11 @@ class ViTDBlockModel(ViTModel):
         labels: torch.Tensor,
         return_layer_logits: bool = False,
     ) -> dict[str, torch.Tensor]:
-        labels = labels.view(-1)
-        z = self.get_embeds(labels, is_input=True)
+        if self.task_type == "classification":
+            labels = labels.view(-1)
+        else:
+            labels = labels.float().view(-1, self.num_labels)
+        z = self.get_target_latents(labels)
         oracle_logits = []
         block_indices = []
         sigmas_trace = []
@@ -1267,19 +1650,20 @@ class ViTDBlockModel(ViTModel):
             )
             if isinstance(denoise_output, dict):
                 logits = denoise_output["logits"]
-                self.append_layer_trace(
-                    denoise_output,
-                    denoise_step_index=step_index,
-                    block_idx=block_idx,
-                    sigma=sigma_value,
-                    layer_logits=layer_logits,
-                    layer_denoise_step_indices=layer_denoise_step_indices,
-                    layer_block_indices=layer_block_indices,
-                    layer_indices_trace=layer_indices_trace,
-                    layer_positions=layer_positions,
-                    layers_in_block_trace=layers_in_block_trace,
-                    layer_sigmas=layer_sigmas,
-                )
+                if "layer_logits" in denoise_output:
+                    self.append_layer_trace(
+                        denoise_output,
+                        denoise_step_index=step_index,
+                        block_idx=block_idx,
+                        sigma=sigma_value,
+                        layer_logits=layer_logits,
+                        layer_denoise_step_indices=layer_denoise_step_indices,
+                        layer_block_indices=layer_block_indices,
+                        layer_indices_trace=layer_indices_trace,
+                        layer_positions=layer_positions,
+                        layers_in_block_trace=layers_in_block_trace,
+                        layer_sigmas=layer_sigmas,
+                    )
             else:
                 logits = denoise_output
             oracle_logits.append(logits)
@@ -1445,7 +1829,10 @@ class ViTDBlockModel(ViTModel):
                 )
                 self.record_oracle_noise_predictions(oracle_noise_trace, labels)
             logits = logits.view(-1, self.num_labels)
-            labels = labels.view(-1)
+            if self.task_type == "regression":
+                labels = labels.float().view(-1, self.num_labels)
+            else:
+                labels = labels.view(-1)
             if step == "val":
                 return self.valid_metrics(logits, labels)
             elif step == "train_eval":
@@ -1469,12 +1856,25 @@ class ViTDBlockModel(ViTModel):
                 step=step,
             )
 
-        z = self.get_embeds(labels, is_input=True)
+        z = self.get_target_latents(labels)
         sigmas = self.get_sigmas(z.shape[0])
         block_idx = self.estimate_target_layer(sigmas)
         sigmas = sigmas.to(z)
         zt = z + sigmas[:, None] * self.sample_epsilon_like(z)
-        logits = self.denoise(pixel_values, zt, sigmas, block_idx)
+        denoise_output = self.denoise(pixel_values, zt, sigmas, block_idx)
+        logits = self.prediction_from_denoise_output(denoise_output)
+        if self.task_type == "regression":
+            per_example_loss = self.per_example_regression_loss(logits, labels)
+            raw_loss = per_example_loss.mean()
+            w = self.get_weights(sigmas)
+            loss = (per_example_loss * w).mean()
+            return loss, {
+                f"{step}/loss": loss,
+                f"{step}/loss_{block_idx}": loss,
+                f"{step}/mse": raw_loss,
+                f"{step}/mse_{block_idx}": raw_loss,
+            }
+
         per_example_loss = self.per_example_classification_loss(logits, labels)
         ce_per_example_loss = self.per_example_classification_loss(
             logits, labels, loss_type="cross_entropy"
@@ -1506,6 +1906,35 @@ class ViTDBlockModel(ViTModel):
             weights = F.softmax(logits, dim=1)
         return F.linear(weights, self.model.get_input_embeddings().weight.t())
 
+    def prediction_from_denoise_output(
+        self, denoise_output: torch.Tensor | dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        if isinstance(denoise_output, dict):
+            return denoise_output["logits"]
+        return denoise_output
+
+    def latent_from_denoise_output(
+        self, denoise_output: torch.Tensor | dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        if self.task_type == "regression":
+            if not isinstance(denoise_output, dict):
+                raise ValueError("Regression denoise output must include a latent")
+            return denoise_output["latent"]
+        if self.uses_residual_next_latent_objective():
+            if not isinstance(denoise_output, dict):
+                raise ValueError("Residual denoise output must include a latent")
+            return denoise_output["latent"]
+        return self.denoised_embedding_from_logits(
+            self.prediction_from_denoise_output(denoise_output)
+        )
+
+    def latent_delta_from_denoise_output(
+        self, denoise_output: torch.Tensor | dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        if not isinstance(denoise_output, dict) or "latent_delta" not in denoise_output:
+            raise ValueError("Residual denoise output must include latent_delta")
+        return denoise_output["latent_delta"]
+
     def append_denoising_loss(
         self,
         logits: torch.Tensor,
@@ -1520,6 +1949,21 @@ class ViTDBlockModel(ViTModel):
         block_idx: int,
         broadcast_weights: bool = False,
     ) -> None:
+        if self.task_type == "regression":
+            per_example_loss = self.per_example_regression_loss(logits, labels)
+            raw_loss = per_example_loss.mean()
+            weights = self.get_weights(sigmas)
+            weighted_loss = (per_example_loss * weights).mean()
+            losses.append(weighted_loss)
+            ce_losses.append(raw_loss)
+            loss_dict[f"{log_prefix}/loss_step_{step_index}"] = weighted_loss
+            loss_dict[f"{log_prefix}/mse_step_{step_index}"] = raw_loss
+            loss_dict[f"{log_prefix}/loss_block_{block_idx}"] = weighted_loss
+            loss_dict[f"{log_prefix}/mse_block_{block_idx}"] = raw_loss
+            loss_dict[f"{log_prefix}/loss_{block_idx}"] = weighted_loss
+            loss_dict[f"{log_prefix}/mse_{block_idx}"] = raw_loss
+            return
+
         per_example_loss = self.per_example_classification_loss(logits, labels)
         ce_per_example_loss = self.per_example_classification_loss(
             logits, labels, loss_type="cross_entropy"
@@ -1547,11 +1991,11 @@ class ViTDBlockModel(ViTModel):
     def euler_update(
         self,
         z: torch.Tensor,
-        logits: torch.Tensor,
+        denoise_output: torch.Tensor | dict[str, torch.Tensor],
         sigma: torch.Tensor,
         next_sigma: torch.Tensor,
     ) -> torch.Tensor:
-        denoised = self.denoised_embedding_from_logits(logits)
+        denoised = self.latent_from_denoise_output(denoise_output)
         d = (z - denoised) / sigma[:, None]
         z = z + (next_sigma - sigma)[:, None] * d
         return z.detach()
@@ -1566,9 +2010,15 @@ class ViTDBlockModel(ViTModel):
         loss = torch.stack(losses).sum()
         ce_loss = torch.stack(ce_losses).sum()
         loss_dict[f"{step}/loss"] = loss
-        loss_dict[f"{step}/ce_loss"] = ce_loss
+        if self.task_type == "regression":
+            loss_dict[f"{step}/mse"] = ce_loss
+        else:
+            loss_dict[f"{step}/ce_loss"] = ce_loss
         loss_dict[f"{step}/loss_mean"] = loss / len(losses)
-        loss_dict[f"{step}/ce_loss_mean"] = ce_loss / len(ce_losses)
+        if self.task_type == "regression":
+            loss_dict[f"{step}/mse_mean"] = ce_loss / len(ce_losses)
+        else:
+            loss_dict[f"{step}/ce_loss_mean"] = ce_loss / len(ce_losses)
         return loss, loss_dict
 
     def sequential_denoising_training_step(
@@ -1577,9 +2027,19 @@ class ViTDBlockModel(ViTModel):
         labels: torch.Tensor,
         step: str = "train",
     ):
+        if self.uses_residual_next_latent_objective():
+            return self.residual_next_latent_training_step(
+                pixel_values,
+                labels,
+                step=step,
+            )
+
         batch_size = pixel_values.shape[0]
         hidden_size = self.model.config.hidden_size
-        labels = labels.view(-1)
+        if self.task_type == "classification":
+            labels = labels.view(-1)
+        else:
+            labels = labels.float().view(-1, self.num_labels)
         z = self.sample_epsilon(
             (batch_size, hidden_size),
             device=pixel_values.device,
@@ -1595,7 +2055,10 @@ class ViTDBlockModel(ViTModel):
         for step_index in range(self.sigmas.shape[0]):
             sigma = self.sigmas[step_index] * s_in
             block_idx = self.estimate_target_layer(sigma)
-            logits = self.denoise(pixel_values, z, sigma, block_idx=block_idx)
+            denoise_output = self.denoise(
+                pixel_values, z, sigma, block_idx=block_idx
+            )
+            logits = self.prediction_from_denoise_output(denoise_output)
             self.append_denoising_loss(
                 logits,
                 labels,
@@ -1612,7 +2075,82 @@ class ViTDBlockModel(ViTModel):
                 continue
 
             next_sigma = self.sigmas[step_index + 1] * s_in
-            z = self.euler_update(z, logits, sigma, next_sigma)
+            z = self.euler_update(z, denoise_output, sigma, next_sigma)
+
+        return self.aggregate_denoising_losses(losses, ce_losses, loss_dict, step)
+
+    def residual_next_latent_training_step(
+        self,
+        pixel_values: torch.Tensor,
+        labels: torch.Tensor,
+        step: str = "train",
+    ):
+        batch_size = pixel_values.shape[0]
+        hidden_size = self.model.config.hidden_size
+        labels = labels.view(-1)
+        z_clean = self.get_target_latents(labels)
+        z = self.sample_epsilon(
+            (batch_size, hidden_size),
+            device=pixel_values.device,
+            dtype=pixel_values.dtype,
+        )
+        z = z * torch.sqrt(1.0 + self.sigmas[0].to(z) ** 2.0)
+        s_in = pixel_values.new_ones([batch_size])
+
+        losses = []
+        ce_losses = []
+        loss_dict = {}
+
+        for step_index in range(self.sigmas.shape[0]):
+            sigma = self.sigmas[step_index] * s_in
+            next_sigma = (
+                self.sigmas[step_index + 1] * s_in
+                if step_index < self.sigmas.shape[0] - 1
+                else torch.zeros_like(sigma)
+            )
+            block_idx = self.estimate_target_layer(sigma)
+            z_input = z.detach()
+            denoise_output = self.denoise(
+                pixel_values,
+                z_input,
+                sigma,
+                block_idx=block_idx,
+            )
+            latent_delta = self.latent_delta_from_denoise_output(denoise_output)
+            z_next_target = z_clean + (next_sigma / sigma)[:, None] * (
+                z_input - z_clean
+            )
+            delta_target = z_next_target - z_input
+            per_example_loss = F.mse_loss(
+                latent_delta,
+                delta_target,
+                reduction="none",
+            ).mean(dim=-1)
+            residual_loss = per_example_loss.mean()
+            logits = self.prediction_from_denoise_output(denoise_output)
+            ce_loss = self.per_example_classification_loss(
+                logits,
+                labels,
+                loss_type="cross_entropy",
+            ).mean()
+
+            losses.append(residual_loss)
+            ce_losses.append(ce_loss)
+            loss_dict[f"{step}/loss_step_{step_index}"] = residual_loss
+            loss_dict[f"{step}/residual_next_latent_mse_step_{step_index}"] = (
+                residual_loss
+            )
+            loss_dict[f"{step}/ce_loss_step_{step_index}"] = ce_loss
+            loss_dict[f"{step}/loss_block_{block_idx}"] = residual_loss
+            loss_dict[f"{step}/residual_next_latent_mse_block_{block_idx}"] = (
+                residual_loss
+            )
+            loss_dict[f"{step}/ce_loss_block_{block_idx}"] = ce_loss
+            loss_dict[f"{step}/loss_{block_idx}"] = residual_loss
+            loss_dict[f"{step}/residual_next_latent_mse_{block_idx}"] = residual_loss
+            loss_dict[f"{step}/ce_loss_{block_idx}"] = ce_loss
+
+            z = z_input + latent_delta.detach()
 
         return self.aggregate_denoising_losses(losses, ce_losses, loss_dict, step)
 
@@ -1623,8 +2161,11 @@ class ViTDBlockModel(ViTModel):
         step: str = "train",
     ):
         batch_size = pixel_values.shape[0]
-        labels = labels.view(-1)
-        z_clean = self.get_embeds(labels, is_input=True)
+        if self.task_type == "classification":
+            labels = labels.view(-1)
+        else:
+            labels = labels.float().view(-1, self.num_labels)
+        z_clean = self.get_target_latents(labels)
         s_in = pixel_values.new_ones([batch_size])
 
         sigma = self.get_sigmas_for_target_block(batch_size, target_block_idx=0).to(
@@ -1637,7 +2178,8 @@ class ViTDBlockModel(ViTModel):
         loss_dict = {}
 
         block_idx = 0
-        logits = self.denoise(pixel_values, z, sigma, block_idx=block_idx)
+        denoise_output = self.denoise(pixel_values, z, sigma, block_idx=block_idx)
+        logits = self.prediction_from_denoise_output(denoise_output)
         self.append_denoising_loss(
             logits,
             labels,
@@ -1654,12 +2196,15 @@ class ViTDBlockModel(ViTModel):
 
         if self.sigmas.shape[0] > 1:
             next_sigma = self.sigmas[1] * s_in
-            z = self.euler_update(z, logits, sigma, next_sigma)
+            z = self.euler_update(z, denoise_output, sigma, next_sigma)
 
         for step_index in range(1, self.sigmas.shape[0]):
             sigma = self.sigmas[step_index] * s_in
             block_idx = self.estimate_target_layer(sigma)
-            logits = self.denoise(pixel_values, z, sigma, block_idx=block_idx)
+            denoise_output = self.denoise(
+                pixel_values, z, sigma, block_idx=block_idx
+            )
+            logits = self.prediction_from_denoise_output(denoise_output)
             self.append_denoising_loss(
                 logits,
                 labels,
@@ -1676,7 +2221,7 @@ class ViTDBlockModel(ViTModel):
                 continue
 
             next_sigma = self.sigmas[step_index + 1] * s_in
-            z = self.euler_update(z, logits, sigma, next_sigma)
+            z = self.euler_update(z, denoise_output, sigma, next_sigma)
 
         return self.aggregate_denoising_losses(losses, ce_losses, loss_dict, step)
 
@@ -1838,7 +2383,7 @@ class ViTDBlockModel(ViTModel):
                 intermediate_logits.append(logits)
                 block_indices.append(block_idx)
                 sigmas_trace.append(self.sigmas[i])
-                if isinstance(denoise_output, dict):
+                if isinstance(denoise_output, dict) and "layer_logits" in denoise_output:
                     self.append_layer_trace(
                         denoise_output,
                         denoise_step_index=i,
@@ -1852,13 +2397,16 @@ class ViTDBlockModel(ViTModel):
                         layers_in_block_trace=layers_in_block_trace,
                         layer_sigmas=layer_sigmas,
                     )
-            denoised = self.denoised_embedding_from_logits(logits)
-            # to d
-            d = (z - denoised) / sigma[:, None]
-            dt = next_sigma - sigma
-            # euler step
-            euler_step = z + dt[:, None] * d
-            z = euler_step
+            if self.uses_residual_next_latent_objective():
+                z = self.latent_from_denoise_output(denoise_output)
+            else:
+                denoised = self.latent_from_denoise_output(denoise_output)
+                # to d
+                d = (z - denoised) / sigma[:, None]
+                dt = next_sigma - sigma
+                # euler step
+                euler_step = z + dt[:, None] * d
+                z = euler_step
         min_sigma = self.sigmas[-1].item()
         sigmas = torch.full((x.shape[0],), min_sigma, device=x.device)
         block_idx = self.estimate_target_layer(sigmas)
@@ -1877,7 +2425,7 @@ class ViTDBlockModel(ViTModel):
             intermediate_logits.append(logits)
             block_indices.append(block_idx)
             sigmas_trace.append(self.sigmas[-1])
-            if isinstance(denoise_output, dict):
+            if isinstance(denoise_output, dict) and "layer_logits" in denoise_output:
                 self.append_layer_trace(
                     denoise_output,
                     denoise_step_index=self.sigmas.shape[0] - 1,

@@ -84,6 +84,38 @@ def _environment_metadata():
     return {key: os.environ[key] for key in keys if key in os.environ}
 
 
+def _synthetic_metadata(args):
+    if getattr(args, "data_name", None) != "synthetic-teacher":
+        return None
+    keys = [
+        "synthetic_target_type",
+        "synthetic_num_train",
+        "synthetic_num_test",
+        "synthetic_input_dim",
+        "synthetic_num_classes",
+        "synthetic_target_dim",
+        "synthetic_teacher_depth",
+        "synthetic_teacher_width",
+        "synthetic_teacher_seed",
+        "synthetic_train_seed",
+        "synthetic_test_seed",
+        "synthetic_teacher_activation",
+        "synthetic_label_noise",
+        "synthetic_target_noise_std",
+        "synthetic_enable_checkpointing",
+        "synthetic_enable_wandb",
+    ]
+    return {key: getattr(args, key) for key in keys}
+
+
+def checkpointing_enabled(args):
+    return args.data_name != "synthetic-teacher" or args.synthetic_enable_checkpointing
+
+
+def wandb_logging_enabled(args):
+    return args.data_name != "synthetic-teacher" or args.synthetic_enable_wandb
+
+
 def _write_json_once(path, data):
     if os.path.exists(path):
         stem, ext = os.path.splitext(path)
@@ -148,6 +180,7 @@ def write_run_metadata(args, logdir):
         "git": _git_metadata(),
         "cuda": _cuda_metadata(),
         "environment": _environment_metadata(),
+        "synthetic": _synthetic_metadata(args),
         "args": args_dict,
     }
     args_path = _write_json_once(os.path.join(logdir, "args.json"), args_dict)
@@ -166,6 +199,7 @@ def write_eval_results(args, data, logdir, ckpt_path, split_results):
         "dataset_name": args.data_name,
         "dataset_source": data.data_name,
         "model_type": args.model_type,
+        "task_type": getattr(args, "task_type", "classification"),
         "ckpt_path": ckpt_path,
         "ece_num_bins": args.ece_num_bins,
         "input_noise_std": args.input_noise_std,
@@ -191,16 +225,28 @@ def write_eval_results(args, data, logdir, ckpt_path, split_results):
             args, "trace_oracle_noise_predictions", False
         ),
         "trace_prediction_examples": getattr(args, "trace_prediction_examples", 16),
+        "synthetic": _synthetic_metadata(args),
         "splits": {},
     }
     for split, metrics in split_results.items():
-        split_payload = {
-            "accuracy": metrics.get("acc"),
-            "f1": metrics.get("f1"),
-            "ece": metrics.get("ece"),
-            "log_likelihood": metrics.get("log_likelihood"),
-            "ece_bins": metrics.get("ece_bins", []),
-        }
+        if getattr(args, "task_type", "classification") == "regression":
+            split_payload = {
+                key: value
+                for key, value in metrics.items()
+                if key
+                not in [
+                    "intermediate_predictions",
+                    "oracle_noise_predictions",
+                ]
+            }
+        else:
+            split_payload = {
+                "accuracy": metrics.get("acc"),
+                "f1": metrics.get("f1"),
+                "ece": metrics.get("ece"),
+                "log_likelihood": metrics.get("log_likelihood"),
+                "ece_bins": metrics.get("ece_bins", []),
+            }
         if "intermediate_predictions" in metrics:
             split_payload["intermediate_predictions"] = metrics[
                 "intermediate_predictions"
@@ -235,9 +281,10 @@ def compute_eval_split_results(model, split):
         split_results[model.strip_metric_prefix(metric_name)] = value
 
     calibration_metric = model.get_calibration_metric(split)
-    with calibration_metric.sync_context():
-        stats = calibration_metric.calibration_stats()
-    split_results["ece_bins"] = model.calibration_rows(stats)
+    if calibration_metric is not None:
+        with calibration_metric.sync_context():
+            stats = calibration_metric.calibration_stats()
+        split_results["ece_bins"] = model.calibration_rows(stats)
 
     if getattr(model, "trace_intermediate_predictions", False):
         split_results["intermediate_predictions"] = (
@@ -300,6 +347,7 @@ def write_blockwise_training_eval_results(
         "dataset_name": args.data_name,
         "dataset_source": data.data_name,
         "model_type": args.model_type,
+        "task_type": getattr(args, "task_type", "classification"),
         "epoch": epoch,
         "global_step": step,
         "ece_num_bins": args.ece_num_bins,
@@ -323,16 +371,28 @@ def write_blockwise_training_eval_results(
             args, "trace_oracle_noise_predictions", False
         ),
         "trace_prediction_examples": getattr(args, "trace_prediction_examples", 16),
+        "synthetic": _synthetic_metadata(args),
         "splits": {},
     }
     for split, metrics in split_results.items():
-        split_payload = {
-            "accuracy": metrics.get("acc"),
-            "f1": metrics.get("f1"),
-            "ece": metrics.get("ece"),
-            "log_likelihood": metrics.get("log_likelihood"),
-            "ece_bins": metrics.get("ece_bins", []),
-        }
+        if getattr(args, "task_type", "classification") == "regression":
+            split_payload = {
+                key: value
+                for key, value in metrics.items()
+                if key
+                not in [
+                    "intermediate_predictions",
+                    "oracle_noise_predictions",
+                ]
+            }
+        else:
+            split_payload = {
+                "accuracy": metrics.get("acc"),
+                "f1": metrics.get("f1"),
+                "ece": metrics.get("ece"),
+                "log_likelihood": metrics.get("log_likelihood"),
+                "ece_bins": metrics.get("ece_bins", []),
+            }
         if "intermediate_predictions" in metrics:
             split_payload["intermediate_predictions"] = metrics[
                 "intermediate_predictions"
@@ -438,6 +498,44 @@ def validate_args(args):
         raise ValueError(
             "--hybrid_block0_independent_training is only supported for dblock"
         )
+    if args.dblock_training_objective != "classification":
+        if args.model_type != "dblock":
+            raise ValueError("--dblock_training_objective is only supported for dblock")
+        if args.dblock_training_objective == "residual_next_latent":
+            if not args.sequential_denoising_training:
+                raise ValueError(
+                    "--dblock_training_objective residual_next_latent requires "
+                    "--sequential_denoising_training"
+                )
+            if args.hybrid_block0_independent_training:
+                raise ValueError(
+                    "--dblock_training_objective residual_next_latent is not "
+                    "currently supported with --hybrid_block0_independent_training"
+                )
+    if args.data_name == "synthetic-teacher":
+        if args.synthetic_num_train < 1:
+            raise ValueError("--synthetic_num_train must be at least 1")
+        if args.synthetic_num_test < 1:
+            raise ValueError("--synthetic_num_test must be at least 1")
+        if args.synthetic_input_dim < 1:
+            raise ValueError("--synthetic_input_dim must be at least 1")
+        if args.synthetic_num_classes < 2:
+            raise ValueError("--synthetic_num_classes must be at least 2")
+        if args.synthetic_target_dim < 1:
+            raise ValueError("--synthetic_target_dim must be at least 1")
+        if args.synthetic_teacher_depth < 1:
+            raise ValueError("--synthetic_teacher_depth must be at least 1")
+        if args.synthetic_teacher_width < 1:
+            raise ValueError("--synthetic_teacher_width must be at least 1")
+        if args.synthetic_label_noise < 0.0 or args.synthetic_label_noise > 1.0:
+            raise ValueError("--synthetic_label_noise must be between 0 and 1")
+        if args.synthetic_target_noise_std < 0.0:
+            raise ValueError("--synthetic_target_noise_std must be non-negative")
+        if (
+            args.synthetic_target_type == "continuous"
+            and args.prediction_average == "probability"
+        ):
+            args.prediction_average = "logit"
 
 
 def main(args):
@@ -451,6 +549,7 @@ def main(args):
     data = load_data(args)
     args.image_size = data.image_size
     args.num_labels = data.num_labels
+    args.task_type = getattr(data, "task_type", "classification")
     apply_checkpoint_defaults(args)
     model = load_model(args)
     if args.ckpt_path is not None:
@@ -465,28 +564,37 @@ def main(args):
     print("Experiment Name:", nowname)
     logdir = os.path.join("logs", nowname)
     write_run_metadata(args, logdir)
-    logger = WandbLogger(
-        project=f"dblocks-{args.data_name}",
-        name=nowname,
-        version=nowname,
-        offline=args.debug,
-        save_dir=logdir,
-        # group=f"{args.data_name}",
+    use_checkpointing = checkpointing_enabled(args)
+    use_wandb_logging = wandb_logging_enabled(args)
+    logger = (
+        WandbLogger(
+            project=f"dblocks-{args.data_name}",
+            name=nowname,
+            version=nowname,
+            offline=args.debug,
+            save_dir=logdir,
+            # group=f"{args.data_name}",
+        )
+        if use_wandb_logging
+        else False
     )
-    callbacks = [
-        ModelCheckpoint(
-            dirpath=logdir,
-            monitor="val/acc" if data.val_key is not None else None,
-            mode="max",
-            save_top_k=args.save_top_k,
-            save_on_train_epoch_end=True,
-            every_n_epochs=args.save_every_n_epochs
-            if data.val_key is None
-            else None,
-            save_last=True,
-        ),
-        LearningRateMonitor(logging_interval="step"),
-    ]
+    callbacks = []
+    if use_checkpointing:
+        callbacks.append(
+            ModelCheckpoint(
+                dirpath=logdir,
+                monitor="val/acc" if data.val_key is not None else None,
+                mode="max",
+                save_top_k=args.save_top_k,
+                save_on_train_epoch_end=True,
+                every_n_epochs=args.save_every_n_epochs
+                if data.val_key is None
+                else None,
+                save_last=True,
+            )
+        )
+    if use_wandb_logging:
+        callbacks.append(LearningRateMonitor(logging_interval="step"))
     if args.blockwise_eval_every_n_epochs > 0:
         callbacks.append(PeriodicBlockwiseEvalCallback(data, args, logdir))
     max_epochs = args.num_epochs
@@ -506,13 +614,19 @@ def main(args):
         else "auto",
         devices=args.devices,
         logger=logger,
+        enable_checkpointing=use_checkpointing,
         num_sanity_val_steps=0,
         # precision="bf16-mixed",
     )
     if args.stage == "train":
         trainer.fit(model, data, ckpt_path=args.ckpt_path)
         run_train_test_evaluation(
-            trainer, model, data, ckpt_path="best", args=args, logdir=logdir
+            trainer,
+            model,
+            data,
+            ckpt_path="best" if use_checkpointing else None,
+            args=args,
+            logdir=logdir,
         )
     else:
         assert args.ckpt_path is not None
@@ -631,6 +745,18 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--dblock_training_objective",
+        type=str,
+        default="classification",
+        choices=["classification", "residual_next_latent"],
+        help=(
+            "DBlock training objective. classification keeps the existing "
+            "logit/clean-target denoising objective; residual_next_latent makes "
+            "each block predict a hidden-size residual delta and applies "
+            "z_next_hat = z + delta_hat toward the next scheduled latent state"
+        ),
+    )
+    parser.add_argument(
         "--epsilon_seed",
         type=int,
         default=None,
@@ -667,6 +793,73 @@ if __name__ == "__main__":
         help=(
             "during training, run blockwise prediction diagnostics on train_eval "
             "and test every N Lightning epochs; 0 disables this"
+        ),
+    )
+    # synthetic teacher dataset
+    parser.add_argument(
+        "--synthetic_target_type",
+        type=str,
+        default="classification",
+        choices=["classification", "continuous"],
+        help="target family for synthetic-teacher",
+    )
+    parser.add_argument("--synthetic_num_train", type=int, default=4096)
+    parser.add_argument("--synthetic_num_test", type=int, default=2048)
+    parser.add_argument(
+        "--synthetic_input_dim",
+        type=int,
+        default=128,
+        help="number of sampled Gaussian input features before padding to an image",
+    )
+    parser.add_argument(
+        "--synthetic_num_classes",
+        type=int,
+        default=10,
+        help="number of teacher argmax classes for synthetic-teacher",
+    )
+    parser.add_argument(
+        "--synthetic_target_dim",
+        type=int,
+        default=4,
+        help="number of continuous target units for synthetic-teacher regression",
+    )
+    parser.add_argument(
+        "--synthetic_teacher_depth",
+        type=int,
+        default=3,
+        help="number of linear layers in the frozen synthetic teacher MLP",
+    )
+    parser.add_argument(
+        "--synthetic_teacher_width",
+        type=int,
+        default=256,
+        help="hidden width of the frozen synthetic teacher MLP",
+    )
+    parser.add_argument("--synthetic_teacher_seed", type=int, default=123)
+    parser.add_argument("--synthetic_train_seed", type=int, default=1000)
+    parser.add_argument("--synthetic_test_seed", type=int, default=2000)
+    parser.add_argument(
+        "--synthetic_teacher_activation",
+        type=str,
+        default="gelu",
+        choices=["gelu", "relu", "tanh"],
+    )
+    parser.add_argument("--synthetic_label_noise", type=float, default=0.0)
+    parser.add_argument("--synthetic_target_noise_std", type=float, default=0.0)
+    parser.add_argument(
+        "--synthetic_enable_checkpointing",
+        action="store_true",
+        help=(
+            "opt into checkpoint files for synthetic-teacher diagnostics; "
+            "image datasets still checkpoint by default"
+        ),
+    )
+    parser.add_argument(
+        "--synthetic_enable_wandb",
+        action="store_true",
+        help=(
+            "opt into W&B logging for synthetic-teacher diagnostics; image "
+            "datasets still use W&B by default"
         ),
     )
     args = parser.parse_args()

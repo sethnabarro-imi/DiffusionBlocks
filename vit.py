@@ -107,10 +107,12 @@ class ViTDiTConfig(ViTConfig):
         self,
         time_conditioning: bool = False,
         cond_hidden_size: int | None = None,
+        latent_prediction_head: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.time_conditioning = time_conditioning
+        self.latent_prediction_head = latent_prediction_head
         if cond_hidden_size is None:
             self.cond_hidden_size = self.hidden_size // 6
         else:
@@ -656,6 +658,11 @@ class ViTDiTForImageClassification(ViTPreTrainedModel):
             if config.num_labels > 0
             else nn.Identity()
         )
+        self.latent_delta_head = (
+            nn.Linear(config.hidden_size, config.hidden_size)
+            if config.latent_prediction_head
+            else None
+        )
         if config.time_conditioning:
             self.adaLN_modulation = AdaLN(
                 config.cond_hidden_size, 2 * config.hidden_size, bias=True
@@ -683,6 +690,9 @@ class ViTDiTForImageClassification(ViTPreTrainedModel):
         nn.init.constant_(self.adaLN_modulation.linear.bias, 0)
         nn.init.constant_(self.classifier.weight, 0)
         nn.init.constant_(self.classifier.bias, 0)
+        if self.latent_delta_head is not None:
+            nn.init.constant_(self.latent_delta_head.weight, 0)
+            nn.init.constant_(self.latent_delta_head.bias, 0)
 
     def get_input_embeddings(self):
         return self.vit.get_input_embeddings()
@@ -739,6 +749,16 @@ class ViTDiTForImageClassification(ViTPreTrainedModel):
             hidden_states = modulate(hidden_states, shift, scale)
         logits = self.classifier(hidden_states[:, 0, :])
         return logits
+
+    def forward_latent_delta(
+        self, hidden_states: torch.Tensor, conditioning: torch.Tensor
+    ):
+        if self.latent_delta_head is None:
+            raise ValueError("latent_prediction_head is not enabled for this model")
+        if self.config.time_conditioning:
+            shift, scale = self.adaLN_modulation(conditioning).chunk(2, dim=1)
+            hidden_states = modulate(hidden_states, shift, scale)
+        return self.latent_delta_head(hidden_states[:, 0, :])
 
     def forward(
         self,
