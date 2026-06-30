@@ -513,6 +513,11 @@ class ViTModel(L.LightningModule):
             args, "classification_loss_type", "cross_entropy"
         )
         self.label_smoothing = getattr(args, "label_smoothing", 0.0)
+        self.multiclass_hinge_margin = getattr(
+            args, "multiclass_hinge_margin", 1.0
+        )
+        self.classifier_head_type = getattr(args, "classifier_head_type", "linear")
+        self.cosine_classifier_scale = getattr(args, "cosine_classifier_scale", 16.0)
         if self.label_smoothing < 0.0 or self.label_smoothing > 1.0:
             raise ValueError("--label_smoothing must be between 0 and 1")
         if (
@@ -522,6 +527,15 @@ class ViTModel(L.LightningModule):
             raise ValueError(
                 "--label_smoothing requires --classification_loss_type cross_entropy"
             )
+        if self.multiclass_hinge_margin <= 0.0:
+            raise ValueError("--multiclass_hinge_margin must be positive")
+        if self.cosine_classifier_scale <= 0.0:
+            raise ValueError("--cosine_classifier_scale must be positive")
+        if (
+            self.classifier_head_type == "cosine"
+            and self.task_type != "classification"
+        ):
+            raise ValueError("--classifier_head_type cosine requires classification")
         self.one_hot_mse_top_k = getattr(args, "one_hot_mse_top_k", None)
         if self.one_hot_mse_top_k is not None:
             if self.one_hot_mse_top_k < 0:
@@ -540,6 +554,8 @@ class ViTModel(L.LightningModule):
             "num_hidden_layers": self.args.num_hidden_layers,
             "attention_probs_dropout_prob": self.args.attention_probs_dropout_prob,
             "hidden_dropout_prob": self.args.hidden_dropout_prob,
+            "classifier_head_type": self.classifier_head_type,
+            "cosine_classifier_scale": self.cosine_classifier_scale,
         }
 
     def build_eval_metrics(self, prefix: str):
@@ -635,6 +651,24 @@ class ViTModel(L.LightningModule):
             selected_loss = per_class_loss.masked_fill(~mask, 0.0).sum(dim=-1)
             selected_count = mask.sum(dim=-1).clamp_min(1)
             return selected_loss / selected_count
+        if loss_type == "brier_score":
+            probs = F.softmax(logits.float(), dim=-1)
+            targets = F.one_hot(labels, num_classes=self.num_labels).to(probs)
+            return (probs - targets).square().sum(dim=-1)
+        if loss_type in ["multiclass_hinge", "squared_multiclass_hinge"]:
+            true_logits = logits.gather(dim=-1, index=labels[:, None]).squeeze(-1)
+            competitor_logits = logits.masked_fill(
+                F.one_hot(labels, num_classes=self.num_labels).bool(),
+                -torch.inf,
+            ).max(dim=-1).values
+            margins = (
+                self.multiclass_hinge_margin
+                + competitor_logits
+                - true_logits
+            ).clamp_min(0.0)
+            if loss_type == "squared_multiclass_hinge":
+                return margins.square()
+            return margins
         raise ValueError(f"Unsupported classification loss type: {loss_type}")
 
     def classification_loss(self, logits: torch.Tensor, labels: torch.Tensor):
@@ -882,6 +916,9 @@ class ViTDBlockModel(ViTModel):
                 "prediction_average": self.prediction_average,
                 "classification_loss_type": self.classification_loss_type,
                 "label_smoothing": self.label_smoothing,
+                "multiclass_hinge_margin": self.multiclass_hinge_margin,
+                "classifier_head_type": self.classifier_head_type,
+                "cosine_classifier_scale": self.cosine_classifier_scale,
                 "one_hot_mse_top_k": self.one_hot_mse_top_k,
                 "dblock_training_objective": self.dblock_training_objective,
                 "sequential_denoising_training": (
@@ -1105,7 +1142,10 @@ class ViTDBlockModel(ViTModel):
             self.model.get_input_embeddings().weight
         )
         latent = self.normalize_embeddings(latent)
-        return F.linear(latent, label_embeddings)
+        logits = F.linear(latent, label_embeddings)
+        if self.classifier_head_type == "cosine":
+            logits = logits * self.cosine_classifier_scale
+        return logits
 
     def pool_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.model.vit.layernorm(hidden_states)

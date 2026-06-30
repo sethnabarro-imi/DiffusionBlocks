@@ -208,6 +208,9 @@ def write_eval_results(args, data, logdir, ckpt_path, split_results):
             args, "classification_loss_type", "cross_entropy"
         ),
         "label_smoothing": getattr(args, "label_smoothing", 0.0),
+        "multiclass_hinge_margin": getattr(args, "multiclass_hinge_margin", 1.0),
+        "classifier_head_type": getattr(args, "classifier_head_type", "linear"),
+        "cosine_classifier_scale": getattr(args, "cosine_classifier_scale", 16.0),
         "one_hot_mse_top_k": getattr(args, "one_hot_mse_top_k", None),
         "num_prediction_samples": args.num_prediction_samples,
         "prediction_average": args.prediction_average,
@@ -358,6 +361,9 @@ def write_blockwise_training_eval_results(
             args, "classification_loss_type", "cross_entropy"
         ),
         "label_smoothing": getattr(args, "label_smoothing", 0.0),
+        "multiclass_hinge_margin": getattr(args, "multiclass_hinge_margin", 1.0),
+        "classifier_head_type": getattr(args, "classifier_head_type", "linear"),
+        "cosine_classifier_scale": getattr(args, "cosine_classifier_scale", 16.0),
         "one_hot_mse_top_k": getattr(args, "one_hot_mse_top_k", None),
         "num_prediction_samples": args.num_prediction_samples,
         "prediction_average": args.prediction_average,
@@ -492,6 +498,10 @@ def validate_args(args):
         raise ValueError(
             "--label_smoothing requires --classification_loss_type cross_entropy"
         )
+    if args.multiclass_hinge_margin <= 0.0:
+        raise ValueError("--multiclass_hinge_margin must be positive")
+    if args.cosine_classifier_scale <= 0.0:
+        raise ValueError("--cosine_classifier_scale must be positive")
     if args.one_hot_mse_top_k is not None:
         if args.one_hot_mse_top_k < 0:
             raise ValueError("--one_hot_mse_top_k must be non-negative")
@@ -695,12 +705,19 @@ if __name__ == "__main__":
         "--classification_loss_type",
         type=str,
         default="cross_entropy",
-        choices=["cross_entropy", "one_hot_mse"],
+        choices=[
+            "cross_entropy",
+            "one_hot_mse",
+            "brier_score",
+            "multiclass_hinge",
+            "squared_multiclass_hinge",
+        ],
         help=(
             "classification loss used for training. cross_entropy keeps the "
             "current logit CE objective; one_hot_mse treats the class-vector "
-            "output as a direct one-hot prediction and applies MSE to the true "
-            "one-hot label"
+            "output as a direct one-hot prediction; brier_score applies MSE to "
+            "softmax probabilities; multiclass_hinge and "
+            "squared_multiclass_hinge use a max-competing-class margin loss"
         ),
     )
     parser.add_argument(
@@ -709,7 +726,7 @@ if __name__ == "__main__":
         default=0.0,
         help=(
             "label smoothing factor for cross-entropy training; 0 keeps hard "
-            "targets, e.g. 0.1 trains against 90% true-class mass and spreads "
+            "targets, e.g. 0.1 trains against 90%% true-class mass and spreads "
             "the remainder over other classes"
         ),
     )
@@ -722,6 +739,31 @@ if __name__ == "__main__":
             "only over the union of the true class and the top-N raw predicted "
             "class outputs; unset keeps full-vector one-hot MSE"
         ),
+    )
+    parser.add_argument(
+        "--multiclass_hinge_margin",
+        type=float,
+        default=1.0,
+        help=(
+            "margin used by --classification_loss_type multiclass_hinge and "
+            "squared_multiclass_hinge"
+        ),
+    )
+    parser.add_argument(
+        "--classifier_head_type",
+        type=str,
+        default="linear",
+        choices=["linear", "cosine"],
+        help=(
+            "classifier head parameterization. cosine normalizes features and "
+            "class weights, then multiplies cosine similarities by a fixed scale"
+        ),
+    )
+    parser.add_argument(
+        "--cosine_classifier_scale",
+        type=float,
+        default=16.0,
+        help="fixed logit scale for --classifier_head_type cosine",
     )
     parser.add_argument("--num_warmup_steps", type=int, default=0)
     parser.add_argument("--deepspeed", action="store_true", help="use deepspeed")

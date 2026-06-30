@@ -92,6 +92,37 @@ class AdaLN(nn.Module):
         return self.silu(self.linear(x))
 
 
+class CosineClassifier(nn.Module):
+    def __init__(self, in_features: int, num_labels: int, scale: float = 16.0):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(num_labels, in_features))
+        self.register_buffer("scale", torch.tensor(float(scale)))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.normal_(self.weight, std=0.02)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = F.normalize(hidden_states, p=2, dim=-1)
+        weight = F.normalize(self.weight, p=2, dim=-1)
+        return F.linear(hidden_states, weight) * self.scale.to(hidden_states)
+
+
+def build_classifier(config) -> nn.Module:
+    if config.num_labels <= 0:
+        return nn.Identity()
+    classifier_head_type = getattr(config, "classifier_head_type", "linear")
+    if classifier_head_type == "linear":
+        return nn.Linear(config.hidden_size, config.num_labels)
+    if classifier_head_type == "cosine":
+        return CosineClassifier(
+            config.hidden_size,
+            config.num_labels,
+            scale=getattr(config, "cosine_classifier_scale", 16.0),
+        )
+    raise ValueError(f"Invalid classifier head type: {classifier_head_type}")
+
+
 ### ViT ###
 class ViTConfig(OrgViTConfig):
     def __init__(self, pooling_type: str | None = None, **kwargs):
@@ -438,6 +469,11 @@ class ViTPreTrainedModel(PreTrainedModel):
 
 
 class ViTForImageClassification(OrgViTForImageClassification):
+    def __init__(self, config: ViTConfig) -> None:
+        super().__init__(config)
+        if getattr(config, "classifier_head_type", "linear") != "linear":
+            self.classifier = build_classifier(config)
+
     def forward(
         self,
         pixel_values: Optional[torch.Tensor] = None,
@@ -653,11 +689,7 @@ class ViTDiTForImageClassification(ViTPreTrainedModel):
         self.vit = ViTDiTModel(config, add_pooling_layer=False)
 
         # Classifier head
-        self.classifier = (
-            nn.Linear(config.hidden_size, config.num_labels)
-            if config.num_labels > 0
-            else nn.Identity()
-        )
+        self.classifier = build_classifier(config)
         self.latent_delta_head = (
             nn.Linear(config.hidden_size, config.hidden_size)
             if config.latent_prediction_head
@@ -688,8 +720,9 @@ class ViTDiTForImageClassification(ViTPreTrainedModel):
         # Zero-out output layers:
         nn.init.constant_(self.adaLN_modulation.linear.weight, 0)
         nn.init.constant_(self.adaLN_modulation.linear.bias, 0)
-        nn.init.constant_(self.classifier.weight, 0)
-        nn.init.constant_(self.classifier.bias, 0)
+        if isinstance(self.classifier, nn.Linear):
+            nn.init.constant_(self.classifier.weight, 0)
+            nn.init.constant_(self.classifier.bias, 0)
         if self.latent_delta_head is not None:
             nn.init.constant_(self.latent_delta_head.weight, 0)
             nn.init.constant_(self.latent_delta_head.bias, 0)

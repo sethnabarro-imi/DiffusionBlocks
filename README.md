@@ -138,6 +138,22 @@ loss type and add:
 --label_smoothing 0.1
 ```
 
+To use alternatives that avoid unbounded cross-entropy margins:
+
+```bash
+--classification_loss_type brier_score
+--classification_loss_type multiclass_hinge
+--classification_loss_type squared_multiclass_hinge
+```
+
+The hinge losses use `--multiclass_hinge_margin 1.0` by default.
+
+To replace the linear classifier with a fixed-scale cosine classifier, add:
+
+```bash
+--classifier_head_type cosine --cosine_classifier_scale 16.0
+```
+
 For continuous teacher targets, switch the target type and set the output
 dimension:
 
