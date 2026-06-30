@@ -131,6 +131,13 @@ To compare categorical cross-entropy with a one-hot MSE likelihood, add:
 --classification_loss_type one_hot_mse
 ```
 
+To train cross-entropy with smoothed classification targets, keep the default
+loss type and add:
+
+```bash
+--label_smoothing 0.1
+```
+
 For continuous teacher targets, switch the target type and set the output
 dimension:
 

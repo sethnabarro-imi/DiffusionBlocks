@@ -207,6 +207,7 @@ def write_eval_results(args, data, logdir, ckpt_path, split_results):
         "classification_loss_type": getattr(
             args, "classification_loss_type", "cross_entropy"
         ),
+        "label_smoothing": getattr(args, "label_smoothing", 0.0),
         "one_hot_mse_top_k": getattr(args, "one_hot_mse_top_k", None),
         "num_prediction_samples": args.num_prediction_samples,
         "prediction_average": args.prediction_average,
@@ -356,6 +357,7 @@ def write_blockwise_training_eval_results(
         "classification_loss_type": getattr(
             args, "classification_loss_type", "cross_entropy"
         ),
+        "label_smoothing": getattr(args, "label_smoothing", 0.0),
         "one_hot_mse_top_k": getattr(args, "one_hot_mse_top_k", None),
         "num_prediction_samples": args.num_prediction_samples,
         "prediction_average": args.prediction_average,
@@ -481,6 +483,15 @@ def validate_args(args):
             raise ValueError(f"--{key} must be between 0 and 1")
     if args.blockwise_eval_every_n_epochs < 0:
         raise ValueError("--blockwise_eval_every_n_epochs must be non-negative")
+    if args.label_smoothing < 0.0 or args.label_smoothing > 1.0:
+        raise ValueError("--label_smoothing must be between 0 and 1")
+    if (
+        args.label_smoothing > 0.0
+        and args.classification_loss_type != "cross_entropy"
+    ):
+        raise ValueError(
+            "--label_smoothing requires --classification_loss_type cross_entropy"
+        )
     if args.one_hot_mse_top_k is not None:
         if args.one_hot_mse_top_k < 0:
             raise ValueError("--one_hot_mse_top_k must be non-negative")
@@ -690,6 +701,16 @@ if __name__ == "__main__":
             "current logit CE objective; one_hot_mse treats the class-vector "
             "output as a direct one-hot prediction and applies MSE to the true "
             "one-hot label"
+        ),
+    )
+    parser.add_argument(
+        "--label_smoothing",
+        type=float,
+        default=0.0,
+        help=(
+            "label smoothing factor for cross-entropy training; 0 keeps hard "
+            "targets, e.g. 0.1 trains against 90% true-class mass and spreads "
+            "the remainder over other classes"
         ),
     )
     parser.add_argument(

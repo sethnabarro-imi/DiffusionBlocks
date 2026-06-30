@@ -512,6 +512,16 @@ class ViTModel(L.LightningModule):
         self.classification_loss_type = getattr(
             args, "classification_loss_type", "cross_entropy"
         )
+        self.label_smoothing = getattr(args, "label_smoothing", 0.0)
+        if self.label_smoothing < 0.0 or self.label_smoothing > 1.0:
+            raise ValueError("--label_smoothing must be between 0 and 1")
+        if (
+            self.label_smoothing > 0.0
+            and self.classification_loss_type != "cross_entropy"
+        ):
+            raise ValueError(
+                "--label_smoothing requires --classification_loss_type cross_entropy"
+            )
         self.one_hot_mse_top_k = getattr(args, "one_hot_mse_top_k", None)
         if self.one_hot_mse_top_k is not None:
             if self.one_hot_mse_top_k < 0:
@@ -591,12 +601,23 @@ class ViTModel(L.LightningModule):
         labels: torch.Tensor,
         *,
         loss_type: str | None = None,
+        label_smoothing: float | None = None,
     ) -> torch.Tensor:
         loss_type = loss_type or self.classification_loss_type
         logits = logits.view(-1, self.num_labels)
         labels = labels.view(-1)
         if loss_type == "cross_entropy":
-            return F.cross_entropy(logits, labels, reduction="none")
+            smoothing = (
+                self.label_smoothing
+                if label_smoothing is None
+                else label_smoothing
+            )
+            return F.cross_entropy(
+                logits,
+                labels,
+                reduction="none",
+                label_smoothing=smoothing,
+            )
         if loss_type == "one_hot_mse":
             targets = F.one_hot(labels, num_classes=self.num_labels).to(logits)
             per_class_loss = F.mse_loss(logits, targets, reduction="none")
@@ -860,6 +881,7 @@ class ViTDBlockModel(ViTModel):
                 "num_prediction_samples": self.num_prediction_samples,
                 "prediction_average": self.prediction_average,
                 "classification_loss_type": self.classification_loss_type,
+                "label_smoothing": self.label_smoothing,
                 "one_hot_mse_top_k": self.one_hot_mse_top_k,
                 "dblock_training_objective": self.dblock_training_objective,
                 "sequential_denoising_training": (
