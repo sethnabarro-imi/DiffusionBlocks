@@ -40,6 +40,11 @@ class ToyConfig:
     prediction_loss_weight: float = 1.0
     latent_loss_weight: float = 0.1
     training_objective: str = "clean_latent"
+    block_objective_pattern: str = "global"
+    denoising_target: str = "embedding"
+    residual_next_latent_training_mode: str = "sequential"
+    initial_noise_mode: str = "per_example"
+    initial_noise_std: float | None = None
     train_encoder_with_prediction_loss_only: bool = False
     observation_noise_std: float = 0.0
     function: str = "sine_poly"
@@ -47,6 +52,7 @@ class ToyConfig:
     output_dir: str = "results/toy_1d_regression"
     eval_every: int = 100
     prediction_grid_points: int = 256
+    prediction_uncertainty_samples: int = 50
     device: str = "auto"
     no_plots: bool = False
 
@@ -110,6 +116,7 @@ class ToyDiffusionBlocks(nn.Module):
     def __init__(self, config: ToyConfig):
         super().__init__()
         self.config = config
+        self.state_dim = 1 if config.denoising_target == "value" else config.latent_dim
         self.target_encoder = nn.Sequential(
             nn.Linear(1, config.latent_dim),
             nn.Tanh(),
@@ -117,15 +124,27 @@ class ToyDiffusionBlocks(nn.Module):
         self.target_decoder = nn.Linear(config.latent_dim, 1)
         self.blocks = nn.ModuleList(
             [
-                DenoisingBlock(config.latent_dim, config.hidden_dim, config.depth)
+                DenoisingBlock(self.state_dim, config.hidden_dim, config.depth)
                 for _ in range(config.num_blocks)
             ]
         )
+        fixed_noise_generator = torch.Generator(device="cpu").manual_seed(
+            config.seed + 75_000
+        )
+        self.register_buffer(
+            "fixed_initial_noise",
+            torch.randn(1, self.state_dim, generator=fixed_noise_generator),
+            persistent=False,
+        )
 
     def clean_latent(self, y: torch.Tensor) -> torch.Tensor:
+        if self.config.denoising_target == "value":
+            return y
         return self.target_encoder(y)
 
     def predict_from_latent(self, z_clean_pred: torch.Tensor) -> torch.Tensor:
+        if self.config.denoising_target == "value":
+            return z_clean_pred
         return self.target_decoder(z_clean_pred)
 
     def euler_update(
@@ -141,6 +160,64 @@ class ToyDiffusionBlocks(nn.Module):
     def uses_residual_next_latent_objective(self) -> bool:
         return self.config.training_objective == "residual_next_latent"
 
+    def uses_residual_to_clean_objective(self) -> bool:
+        return self.config.training_objective == "residual_to_clean"
+
+    def uses_residual_objective(self) -> bool:
+        return self.config.training_objective in [
+            "residual_next_latent",
+            "residual_to_clean",
+        ]
+
+    def uses_patterned_block_objectives(self) -> bool:
+        return self.config.block_objective_pattern != "global"
+
+    def block_objective(self, block_index: int) -> str:
+        pattern = self.config.block_objective_pattern
+        residual_objective = (
+            "residual_to_clean"
+            if self.uses_residual_to_clean_objective()
+            else "residual_next_latent"
+        )
+        if pattern == "global":
+            if self.uses_residual_next_latent_objective():
+                return "residual_next_latent"
+            if self.uses_residual_to_clean_objective():
+                return "residual_to_clean"
+            return "prediction"
+        if pattern == "all_prediction":
+            return "prediction"
+        if pattern == "all_residual":
+            return residual_objective
+        if pattern == "first_prediction_then_residual":
+            if block_index == 0:
+                return "prediction"
+            return residual_objective
+        if pattern == "alternating_prediction_residual":
+            if block_index % 2 == 0:
+                return "prediction"
+            return residual_objective
+        raise ValueError(f"Unknown block_objective_pattern: {pattern}")
+
+    def block_uses_residual_next_latent(self, block_index: int) -> bool:
+        return self.block_objective(block_index) == "residual_next_latent"
+
+    def block_uses_residual_to_clean(self, block_index: int) -> bool:
+        return self.block_objective(block_index) == "residual_to_clean"
+
+    def block_uses_residual_update(self, block_index: int) -> bool:
+        return self.block_objective(block_index) in [
+            "residual_next_latent",
+            "residual_to_clean",
+        ]
+
+    def residual_update_alpha(
+        self,
+        sigma: torch.Tensor,
+        next_sigma: torch.Tensor,
+    ) -> torch.Tensor:
+        return 1.0 - next_sigma / sigma
+
     def prediction_loss_weights(self, reference: torch.Tensor) -> torch.Tensor:
         weights = torch.full(
             (self.config.num_blocks,),
@@ -151,12 +228,46 @@ class ToyDiffusionBlocks(nn.Module):
         weights[-1] = torch.maximum(weights[-1], weights.new_tensor(1.0))
         return weights
 
+    def initial_noise(
+        self,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if self.config.initial_noise_mode == "per_example":
+            return torch.randn(
+                batch_size,
+                self.state_dim,
+                device=device,
+                dtype=dtype,
+            )
+        if self.config.initial_noise_mode == "shared_per_batch":
+            return torch.randn(
+                1,
+                self.state_dim,
+                device=device,
+                dtype=dtype,
+            ).expand(batch_size, -1)
+        if self.config.initial_noise_mode == "fixed_shared":
+            return self.fixed_initial_noise.to(device=device, dtype=dtype).expand(
+                batch_size,
+                -1,
+            )
+        raise ValueError(f"Unknown initial_noise_mode: {self.config.initial_noise_mode}")
+
+    def initial_noise_scale(self, sigmas: torch.Tensor) -> torch.Tensor:
+        if self.config.initial_noise_std is not None:
+            return sigmas.new_tensor(self.config.initial_noise_std)
+        return torch.sqrt(1.0 + sigmas[0] ** 2)
+
     def latent_target_for_loss(self, z_clean: torch.Tensor) -> torch.Tensor:
         if self.config.train_encoder_with_prediction_loss_only:
             return z_clean.detach()
         return z_clean
 
     def encoder_prediction_loss(self, z_clean: torch.Tensor, y: torch.Tensor):
+        if self.config.denoising_target == "value":
+            return z_clean.new_zeros(())
         if not self.config.train_encoder_with_prediction_loss_only:
             return z_clean.new_zeros(())
         encoder_prediction = self.predict_from_latent(z_clean)
@@ -168,27 +279,38 @@ class ToyDiffusionBlocks(nn.Module):
         sigmas: torch.Tensor,
         *,
         noise: torch.Tensor | None = None,
+        prediction_mode: str = "state",
     ):
+        if prediction_mode not in ["state", "clean_estimate"]:
+            raise ValueError(f"Unknown prediction_mode: {prediction_mode}")
         batch_size = x.shape[0]
         if noise is None:
-            z = torch.randn(
-                batch_size,
-                self.config.latent_dim,
-                device=x.device,
-                dtype=x.dtype,
-            )
+            z = self.initial_noise(batch_size, x.device, x.dtype)
         else:
             z = noise.to(device=x.device, dtype=x.dtype)
-        z = z * torch.sqrt(1.0 + sigmas[0] ** 2)
+        z = z * self.initial_noise_scale(sigmas)
 
         predictions = []
         latents = []
         for block_index, block in enumerate(self.blocks):
             sigma = sigmas[block_index].expand(batch_size)
+            next_sigma = (
+                sigmas[block_index + 1].expand(batch_size)
+                if block_index < len(self.blocks) - 1
+                else torch.zeros_like(sigma)
+            )
             block_output = block(x, z, sigma)
-            if self.uses_residual_next_latent_objective():
+            if self.block_uses_residual_next_latent(block_index):
                 z_next_pred = z + block_output
                 y_pred = self.predict_from_latent(z_next_pred)
+                latent_prediction = z_next_pred
+            elif self.block_uses_residual_to_clean(block_index):
+                alpha = self.residual_update_alpha(sigma, next_sigma)
+                z_next_pred = z + alpha[:, None] * block_output
+                if prediction_mode == "clean_estimate":
+                    y_pred = self.predict_from_latent(z + block_output)
+                else:
+                    y_pred = self.predict_from_latent(z_next_pred)
                 latent_prediction = z_next_pred
             else:
                 y_pred = self.predict_from_latent(block_output)
@@ -196,8 +318,7 @@ class ToyDiffusionBlocks(nn.Module):
             predictions.append(y_pred)
             latents.append(latent_prediction)
             if block_index < len(self.blocks) - 1:
-                next_sigma = sigmas[block_index + 1].expand(batch_size)
-                if self.uses_residual_next_latent_objective():
+                if self.block_uses_residual_update(block_index):
                     z = z_next_pred.detach()
                 else:
                     z = self.euler_update(z, block_output, sigma, next_sigma).detach()
@@ -221,9 +342,19 @@ class ToyDiffusionBlocks(nn.Module):
             else:
                 epsilon = noise.to(device=x.device, dtype=x.dtype)
             z_noisy = z_clean + sigma[:, None] * epsilon
+            next_sigma = (
+                sigmas[block_index + 1].expand(x.shape[0])
+                if block_index < len(self.blocks) - 1
+                else torch.zeros_like(sigma)
+            )
             block_output = block(x, z_noisy, sigma)
-            if self.uses_residual_next_latent_objective():
+            if self.block_uses_residual_next_latent(block_index):
                 z_next_pred = z_noisy + block_output
+                y_pred = self.predict_from_latent(z_next_pred)
+                latent_prediction = z_next_pred
+            elif self.block_uses_residual_to_clean(block_index):
+                alpha = self.residual_update_alpha(sigma, next_sigma)
+                z_next_pred = z_noisy + alpha[:, None] * block_output
                 y_pred = self.predict_from_latent(z_next_pred)
                 latent_prediction = z_next_pred
             else:
@@ -234,8 +365,12 @@ class ToyDiffusionBlocks(nn.Module):
         return torch.stack(predictions), torch.stack(latents)
 
     def training_loss(self, x: torch.Tensor, y: torch.Tensor, sigmas: torch.Tensor):
+        if self.uses_patterned_block_objectives():
+            return self.patterned_block_objective_training_loss(x, y, sigmas)
         if self.uses_residual_next_latent_objective():
             return self.residual_next_latent_training_loss(x, y, sigmas)
+        if self.uses_residual_to_clean_objective():
+            return self.residual_to_clean_training_loss(x, y, sigmas)
 
         z_clean = self.clean_latent(y)
         z_clean_target = self.latent_target_for_loss(z_clean)
@@ -271,7 +406,7 @@ class ToyDiffusionBlocks(nn.Module):
             ),
         }
 
-    def residual_next_latent_training_loss(
+    def patterned_block_objective_training_loss(
         self,
         x: torch.Tensor,
         y: torch.Tensor,
@@ -279,13 +414,99 @@ class ToyDiffusionBlocks(nn.Module):
     ):
         batch_size = x.shape[0]
         z_clean = self.clean_latent(y)
-        z = torch.randn(
-            batch_size,
-            self.config.latent_dim,
-            device=x.device,
-            dtype=x.dtype,
-        )
-        z = z * torch.sqrt(1.0 + sigmas[0] ** 2)
+        z_clean_target = self.latent_target_for_loss(z_clean)
+        z = self.initial_noise(batch_size, x.device, x.dtype)
+        z = z * self.initial_noise_scale(sigmas)
+
+        predictions = []
+        mse_losses = []
+        residual_losses = []
+        per_block_losses = []
+        encoder_prediction_losses = []
+        for block_index, block in enumerate(self.blocks):
+            sigma = sigmas[block_index].expand(batch_size)
+            next_sigma = (
+                sigmas[block_index + 1].expand(batch_size)
+                if block_index < len(self.blocks) - 1
+                else torch.zeros_like(sigma)
+            )
+            z_input = z.detach()
+            block_output = block(x, z_input, sigma)
+            if self.block_uses_residual_next_latent(block_index):
+                z_next_pred = z_input + block_output
+                z_next_target = z_clean_target + (next_sigma / sigma)[:, None] * (
+                    z_input - z_clean_target
+                )
+                delta_target = z_next_target - z_input
+                residual_loss = F.mse_loss(block_output, delta_target)
+                y_pred = self.predict_from_latent(z_next_pred)
+                prediction_loss = F.mse_loss(y_pred, y)
+                per_block_loss = self.config.latent_loss_weight * residual_loss
+                z = z_next_pred.detach()
+            elif self.block_uses_residual_to_clean(block_index):
+                alpha = self.residual_update_alpha(sigma, next_sigma)
+                residual_target = z_clean_target - z_input
+                z_next_pred = z_input + alpha[:, None] * block_output
+                residual_loss = F.mse_loss(block_output, residual_target)
+                y_pred = self.predict_from_latent(z_next_pred)
+                prediction_loss = F.mse_loss(y_pred, y)
+                per_block_loss = self.config.latent_loss_weight * residual_loss
+                z = z_next_pred.detach()
+            else:
+                z_clean_pred = block_output
+                y_pred = self.predict_from_latent(z_clean_pred)
+                prediction_loss = F.mse_loss(y_pred, y)
+                residual_loss = prediction_loss.new_zeros(())
+                per_block_loss = prediction_loss
+                if block_index < len(self.blocks) - 1:
+                    z = self.euler_update(
+                        z_input,
+                        z_clean_pred,
+                        sigma,
+                        next_sigma,
+                    ).detach()
+
+            predictions.append(y_pred)
+            mse_losses.append(prediction_loss)
+            residual_losses.append(residual_loss)
+            per_block_losses.append(per_block_loss)
+            encoder_prediction_losses.append(prediction_loss.new_zeros(()))
+
+        mse_losses = torch.stack(mse_losses)
+        residual_losses = torch.stack(residual_losses)
+        per_block_losses = torch.stack(per_block_losses)
+        encoder_prediction_losses = torch.stack(encoder_prediction_losses)
+        loss = per_block_losses.sum()
+        return loss, {
+            "mse_mean": mse_losses.mean().detach(),
+            "latent_mse_mean": residual_losses.mean().detach(),
+            "encoder_prediction_loss": encoder_prediction_losses.sum().detach(),
+            "per_block_loss": per_block_losses.detach(),
+            "per_block_mse_loss": mse_losses.detach(),
+            "per_block_latent_mse_loss": residual_losses.detach(),
+            "per_block_encoder_prediction_loss": (
+                encoder_prediction_losses.detach()
+            ),
+        }
+
+    def residual_next_latent_training_loss(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        sigmas: torch.Tensor,
+    ):
+        if self.config.residual_next_latent_training_mode == "independent":
+            return self.independent_residual_next_latent_training_loss(x, y, sigmas)
+        if self.config.residual_next_latent_training_mode != "sequential":
+            raise ValueError(
+                "Unsupported residual_next_latent_training_mode: "
+                f"{self.config.residual_next_latent_training_mode}"
+            )
+
+        batch_size = x.shape[0]
+        z_clean = self.clean_latent(y)
+        z = self.initial_noise(batch_size, x.device, x.dtype)
+        z = z * self.initial_noise_scale(sigmas)
 
         predictions = []
         residual_losses = []
@@ -310,6 +531,187 @@ class ToyDiffusionBlocks(nn.Module):
             predictions.append(self.predict_from_latent(z_next_pred))
             z = z_next_pred.detach()
 
+        predictions = torch.stack(predictions)
+        residual_losses = torch.stack(residual_losses)
+        mse_losses = F.mse_loss(
+            predictions,
+            y.unsqueeze(0).expand_as(predictions),
+            reduction="none",
+        ).mean(dim=(1, 2))
+        encoder_prediction_loss = self.encoder_prediction_loss(z_clean, y)
+        encoder_prediction_losses = torch.zeros_like(mse_losses)
+        encoder_prediction_losses[-1] = encoder_prediction_loss
+        per_block_losses = (
+            self.prediction_loss_weights(mse_losses) * mse_losses
+            + self.config.latent_loss_weight * residual_losses
+            + encoder_prediction_losses
+        )
+        loss = per_block_losses.sum()
+        return loss, {
+            "mse_mean": mse_losses.mean().detach(),
+            "latent_mse_mean": residual_losses.mean().detach(),
+            "encoder_prediction_loss": encoder_prediction_loss.detach(),
+            "per_block_loss": per_block_losses.detach(),
+            "per_block_mse_loss": mse_losses.detach(),
+            "per_block_latent_mse_loss": residual_losses.detach(),
+            "per_block_encoder_prediction_loss": (
+                encoder_prediction_losses.detach()
+            ),
+        }
+
+    def independent_residual_next_latent_training_loss(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        sigmas: torch.Tensor,
+    ):
+        z_clean = self.clean_latent(y)
+        z_clean_target = self.latent_target_for_loss(z_clean)
+
+        predictions = []
+        residual_losses = []
+        for block_index, block in enumerate(self.blocks):
+            sigma = sigmas[block_index].expand(x.shape[0])
+            next_sigma = (
+                sigmas[block_index + 1].expand(x.shape[0])
+                if block_index < len(self.blocks) - 1
+                else torch.zeros_like(sigma)
+            )
+            epsilon = torch.randn_like(z_clean_target)
+            z_input = (z_clean_target + sigma[:, None] * epsilon).detach()
+            z_next_target = z_clean_target + next_sigma[:, None] * epsilon
+            delta_target = z_next_target - z_input
+
+            delta_pred = block(x, z_input, sigma)
+            z_next_pred = z_input + delta_pred
+            residual_losses.append(
+                F.mse_loss(delta_pred, delta_target, reduction="none").mean(dim=(0, 1))
+            )
+            predictions.append(self.predict_from_latent(z_next_pred))
+
+        predictions = torch.stack(predictions)
+        residual_losses = torch.stack(residual_losses)
+        mse_losses = F.mse_loss(
+            predictions,
+            y.unsqueeze(0).expand_as(predictions),
+            reduction="none",
+        ).mean(dim=(1, 2))
+        encoder_prediction_loss = self.encoder_prediction_loss(z_clean, y)
+        encoder_prediction_losses = torch.zeros_like(mse_losses)
+        encoder_prediction_losses[-1] = encoder_prediction_loss
+        per_block_losses = (
+            self.prediction_loss_weights(mse_losses) * mse_losses
+            + self.config.latent_loss_weight * residual_losses
+            + encoder_prediction_losses
+        )
+        loss = per_block_losses.sum()
+        return loss, {
+            "mse_mean": mse_losses.mean().detach(),
+            "latent_mse_mean": residual_losses.mean().detach(),
+            "encoder_prediction_loss": encoder_prediction_loss.detach(),
+            "per_block_loss": per_block_losses.detach(),
+            "per_block_mse_loss": mse_losses.detach(),
+            "per_block_latent_mse_loss": residual_losses.detach(),
+            "per_block_encoder_prediction_loss": (
+                encoder_prediction_losses.detach()
+            ),
+        }
+
+    def residual_to_clean_training_loss(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        sigmas: torch.Tensor,
+    ):
+        if self.config.residual_next_latent_training_mode == "independent":
+            return self.independent_residual_to_clean_training_loss(x, y, sigmas)
+        if self.config.residual_next_latent_training_mode != "sequential":
+            raise ValueError(
+                "Unsupported residual_next_latent_training_mode: "
+                f"{self.config.residual_next_latent_training_mode}"
+            )
+
+        batch_size = x.shape[0]
+        z_clean = self.clean_latent(y)
+        z_clean_target = self.latent_target_for_loss(z_clean)
+        z = self.initial_noise(batch_size, x.device, x.dtype)
+        z = z * self.initial_noise_scale(sigmas)
+
+        predictions = []
+        residual_losses = []
+        for block_index, block in enumerate(self.blocks):
+            sigma = sigmas[block_index].expand(batch_size)
+            next_sigma = (
+                sigmas[block_index + 1].expand(batch_size)
+                if block_index < len(self.blocks) - 1
+                else torch.zeros_like(sigma)
+            )
+            z_input = z.detach()
+            residual_pred = block(x, z_input, sigma)
+            residual_target = z_clean_target - z_input
+            alpha = self.residual_update_alpha(sigma, next_sigma)
+            z_next_pred = z_input + alpha[:, None] * residual_pred
+            residual_losses.append(
+                F.mse_loss(residual_pred, residual_target, reduction="none").mean(
+                    dim=(0, 1)
+                )
+            )
+            predictions.append(self.predict_from_latent(z_next_pred))
+            z = z_next_pred.detach()
+
+        return self.aggregate_residual_training_loss(
+            predictions,
+            residual_losses,
+            z_clean,
+            y,
+        )
+
+    def independent_residual_to_clean_training_loss(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        sigmas: torch.Tensor,
+    ):
+        z_clean = self.clean_latent(y)
+        z_clean_target = self.latent_target_for_loss(z_clean)
+
+        predictions = []
+        residual_losses = []
+        for block_index, block in enumerate(self.blocks):
+            sigma = sigmas[block_index].expand(x.shape[0])
+            next_sigma = (
+                sigmas[block_index + 1].expand(x.shape[0])
+                if block_index < len(self.blocks) - 1
+                else torch.zeros_like(sigma)
+            )
+            epsilon = torch.randn_like(z_clean_target)
+            z_input = (z_clean_target + sigma[:, None] * epsilon).detach()
+            residual_target = z_clean_target - z_input
+
+            residual_pred = block(x, z_input, sigma)
+            alpha = self.residual_update_alpha(sigma, next_sigma)
+            z_next_pred = z_input + alpha[:, None] * residual_pred
+            residual_losses.append(
+                F.mse_loss(residual_pred, residual_target, reduction="none").mean(
+                    dim=(0, 1)
+                )
+            )
+            predictions.append(self.predict_from_latent(z_next_pred))
+
+        return self.aggregate_residual_training_loss(
+            predictions,
+            residual_losses,
+            z_clean,
+            y,
+        )
+
+    def aggregate_residual_training_loss(
+        self,
+        predictions: list[torch.Tensor],
+        residual_losses: list[torch.Tensor],
+        z_clean: torch.Tensor,
+        y: torch.Tensor,
+    ):
         predictions = torch.stack(predictions)
         residual_losses = torch.stack(residual_losses)
         mse_losses = F.mse_loss(
@@ -442,15 +844,35 @@ def evaluate_prediction_curves(
         device=sigmas.device,
     ).view(-1, 1)
     generator = torch.Generator(device="cpu").manual_seed(config.seed + 50_000)
-    noise = torch.randn(
-        config.prediction_grid_points,
-        config.latent_dim,
-        generator=generator,
-        device="cpu",
-    ).to(sigmas.device)
+    if config.initial_noise_mode == "per_example":
+        noise = torch.randn(
+            config.prediction_grid_points,
+            model.state_dim,
+            generator=generator,
+            device="cpu",
+        ).to(sigmas.device)
+    elif config.initial_noise_mode == "shared_per_batch":
+        noise = torch.randn(
+            1,
+            model.state_dim,
+            generator=generator,
+            device="cpu",
+        ).to(sigmas.device).expand(config.prediction_grid_points, -1)
+    elif config.initial_noise_mode == "fixed_shared":
+        noise = model.fixed_initial_noise.to(sigmas.device).expand(
+            config.prediction_grid_points,
+            -1,
+        )
+    else:
+        raise ValueError(f"Unknown initial_noise_mode: {config.initial_noise_mode}")
     with torch.no_grad():
         target = target_function(x, config.function)
-        predictions, _ = model.sequential_predictions(x, sigmas, noise=noise)
+        predictions, _ = model.sequential_predictions(
+            x,
+            sigmas,
+            noise=noise,
+            prediction_mode="clean_estimate",
+        )
 
     rows = []
     cpu_x = x[:, 0].detach().cpu().tolist()
@@ -468,6 +890,67 @@ def evaluate_prediction_curves(
                     "x": x_value,
                     "target_y": target_value,
                     "sequential_prediction": prediction_value,
+                }
+            )
+    return rows
+
+
+def evaluate_prediction_uncertainty(
+    model: ToyDiffusionBlocks,
+    config: ToyConfig,
+    sigmas: torch.Tensor,
+) -> list[dict]:
+    if config.prediction_uncertainty_samples <= 0:
+        return []
+
+    model.eval()
+    x = torch.linspace(
+        -3.2,
+        3.2,
+        config.prediction_grid_points,
+        device=sigmas.device,
+    ).view(-1, 1)
+    generator = torch.Generator(device="cpu").manual_seed(config.seed + 90_000)
+    sample_predictions = []
+    with torch.no_grad():
+        target = target_function(x, config.function)
+        for _ in range(config.prediction_uncertainty_samples):
+            noise = torch.randn(
+                config.prediction_grid_points,
+                model.state_dim,
+                generator=generator,
+                device="cpu",
+            ).to(sigmas.device)
+            predictions, _ = model.sequential_predictions(
+                x,
+                sigmas,
+                noise=noise,
+                prediction_mode="clean_estimate",
+            )
+            sample_predictions.append(predictions[:, :, 0].detach().cpu())
+
+    samples = torch.stack(sample_predictions)
+    means = samples.mean(dim=0)
+    stds = samples.std(dim=0, unbiased=False)
+    cpu_x = x[:, 0].detach().cpu().tolist()
+    cpu_target = target[:, 0].detach().cpu().tolist()
+    rows = []
+    for block_index in range(config.num_blocks):
+        for point_index, x_value in enumerate(cpu_x):
+            mean = float(means[block_index, point_index])
+            std = float(stds[block_index, point_index])
+            rows.append(
+                {
+                    "block_index": block_index,
+                    "point_index": point_index,
+                    "x": x_value,
+                    "target_y": cpu_target[point_index],
+                    "prediction_mean": mean,
+                    "prediction_std": std,
+                    "prediction_lower_1sigma": mean - std,
+                    "prediction_upper_1sigma": mean + std,
+                    "prediction_lower_2sigma": mean - 2.0 * std,
+                    "prediction_upper_2sigma": mean + 2.0 * std,
                 }
             )
     return rows
@@ -579,17 +1062,24 @@ def write_eval_cycle_rmse_csv(history: list[dict], path: str) -> None:
         writer.writerows(rows)
 
 
-def write_eval_cycle_latent_distance_csv(history: list[dict], path: str) -> None:
+def write_eval_cycle_latent_distance_csv(
+    history: list[dict],
+    path: str,
+    split: str,
+) -> None:
     rows = []
+    block_rows_key = f"{split}_block_rows"
     for item in history:
         epoch = item["epoch"]
-        for row in sorted(item["test_block_rows"], key=lambda r: r["block_index"]):
+        for row in sorted(item[block_rows_key], key=lambda r: r["block_index"]):
             rows.append(
                 {
                     "epoch": epoch,
                     "block_index": row["block_index"],
-                    "test_sequential_latent_rmse": row["sequential_latent_rmse"],
-                    "test_oracle_latent_rmse": row["oracle_latent_rmse"],
+                    f"{split}_sequential_latent_rmse": row[
+                        "sequential_latent_rmse"
+                    ],
+                    f"{split}_oracle_latent_rmse": row["oracle_latent_rmse"],
                 }
             )
     with open(path, "w", newline="") as f:
@@ -598,8 +1088,8 @@ def write_eval_cycle_latent_distance_csv(history: list[dict], path: str) -> None
             fieldnames=[
                 "epoch",
                 "block_index",
-                "test_sequential_latent_rmse",
-                "test_oracle_latent_rmse",
+                f"{split}_sequential_latent_rmse",
+                f"{split}_oracle_latent_rmse",
             ],
         )
         writer.writeheader()
@@ -620,6 +1110,7 @@ def write_eval_cycle_train_loss_csv(history: list[dict], path: str) -> None:
             fieldnames=[
                 "epoch",
                 "block_index",
+                "block_objective",
                 "sigma",
                 "train_loss",
                 "train_mse_loss",
@@ -653,6 +1144,380 @@ def write_prediction_curve_csv(history: list[dict], path: str) -> None:
         )
         writer.writeheader()
         writer.writerows(rows)
+
+
+def write_prediction_uncertainty_csv(rows: list[dict], path: str) -> None:
+    if not rows:
+        return
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "block_index",
+                "point_index",
+                "x",
+                "target_y",
+                "prediction_mean",
+                "prediction_std",
+                "prediction_lower_1sigma",
+                "prediction_upper_1sigma",
+                "prediction_lower_2sigma",
+                "prediction_upper_2sigma",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_prediction_uncertainty_plot(
+    rows: list[dict],
+    train_data: TensorDataset,
+    test_data: TensorDataset,
+    png_path: str,
+    svg_path: str,
+) -> bool:
+    if not rows:
+        return False
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return False
+
+    blocks = sorted({int(row["block_index"]) for row in rows})
+    by_block = {block: [] for block in blocks}
+    for row in rows:
+        by_block[int(row["block_index"])].append(row)
+    for block_rows in by_block.values():
+        block_rows.sort(key=lambda row: int(row["point_index"]))
+
+    train_x, train_y = train_data.tensors
+    test_x, test_y = test_data.tensors
+    train_points = [
+        (float(x), float(y))
+        for x, y in zip(train_x[:, 0].tolist(), train_y[:, 0].tolist())
+    ]
+    test_points = [
+        (float(x), float(y))
+        for x, y in zip(test_x[:, 0].tolist(), test_y[:, 0].tolist())
+    ]
+
+    x_values = [float(row["x"]) for row in rows] + [
+        x for x, _ in train_points + test_points
+    ]
+    y_values = (
+        [float(row["target_y"]) for row in rows]
+        + [float(row["prediction_lower_2sigma"]) for row in rows]
+        + [float(row["prediction_upper_2sigma"]) for row in rows]
+        + [y for _, y in train_points + test_points]
+    )
+    x_min, x_max = min(x_values), max(x_values)
+    y_min, y_max = min(y_values), max(y_values)
+    y_pad = 0.08 * max(y_max - y_min, 1e-6)
+    y_min -= y_pad
+    y_max += y_pad
+
+    columns = min(3, len(blocks))
+    panel_rows = math.ceil(len(blocks) / columns)
+    panel_w = 300
+    panel_h = 220
+    left = 72
+    top = 74
+    gap_x = 34
+    gap_y = 48
+    right = 160
+    bottom = 64
+    width = left + columns * panel_w + (columns - 1) * gap_x + right
+    height = top + panel_rows * panel_h + (panel_rows - 1) * gap_y + bottom
+
+    def sx(x: float, panel_left: float) -> float:
+        if x_max == x_min:
+            return panel_left + panel_w / 2
+        return panel_left + (x - x_min) / (x_max - x_min) * panel_w
+
+    def sy(y: float, panel_top: float) -> float:
+        if y_max == y_min:
+            return panel_top + panel_h / 2
+        return panel_top + (y_max - y) / (y_max - y_min) * panel_h
+
+    def line_points(block: int, field: str, panel_left: float, panel_top: float):
+        return [
+            (sx(float(row["x"]), panel_left), sy(float(row[field]), panel_top))
+            for row in by_block[block]
+        ]
+
+    def band_polygon(
+        block: int,
+        lower_field: str,
+        upper_field: str,
+        panel_left: float,
+        panel_top: float,
+    ):
+        upper = line_points(block, upper_field, panel_left, panel_top)
+        lower = line_points(block, lower_field, panel_left, panel_top)
+        return upper + list(reversed(lower))
+
+    image = Image.new("RGB", (width, height), "white")
+    overlay = Image.new("RGBA", (width, height), (255, 255, 255, 0))
+    draw = ImageDraw.Draw(image)
+    overlay_draw = ImageDraw.Draw(overlay)
+    try:
+        font = ImageFont.truetype(
+            "/System/Library/Fonts/Supplemental/Arial.ttf", 12
+        )
+        small_font = ImageFont.truetype(
+            "/System/Library/Fonts/Supplemental/Arial.ttf", 11
+        )
+        font_bold = ImageFont.truetype(
+            "/System/Library/Fonts/Supplemental/Arial Bold.ttf", 14
+        )
+        title_font = ImageFont.truetype(
+            "/System/Library/Fonts/Supplemental/Arial Bold.ttf", 22
+        )
+    except OSError:
+        font = small_font = font_bold = title_font = ImageFont.load_default()
+
+    draw.text(
+        (left, 26),
+        "Prediction Distribution by Initial Noise",
+        font=title_font,
+        fill=(17, 24, 39),
+    )
+
+    for panel_index, block in enumerate(blocks):
+        row_index = panel_index // columns
+        col_index = panel_index % columns
+        panel_left = left + col_index * (panel_w + gap_x)
+        panel_top = top + row_index * (panel_h + gap_y)
+        panel_right = panel_left + panel_w
+        panel_bottom = panel_top + panel_h
+
+        for tick in range(4):
+            yy = panel_top + tick * panel_h / 3
+            draw.line(
+                (panel_left, yy, panel_right, yy),
+                fill=(229, 231, 235),
+                width=1,
+            )
+        for tick in range(4):
+            xx = panel_left + tick * panel_w / 3
+            draw.line(
+                (xx, panel_top, xx, panel_bottom),
+                fill=(229, 231, 235),
+                width=1,
+            )
+        draw.rectangle(
+            (panel_left, panel_top, panel_right, panel_bottom),
+            outline=(17, 24, 39),
+            width=1,
+        )
+        draw.text(
+            (panel_left + 6, panel_top + 6),
+            f"block {block}",
+            font=font_bold,
+            fill=(17, 24, 39),
+        )
+        if row_index == panel_rows - 1:
+            draw.text(
+                (panel_left, panel_bottom + 8),
+                f"{x_min:.1f}",
+                font=small_font,
+                fill=(17, 24, 39),
+            )
+            draw.text(
+                (panel_right, panel_bottom + 8),
+                f"{x_max:.1f}",
+                font=small_font,
+                fill=(17, 24, 39),
+                anchor="ra",
+            )
+        if col_index == 0:
+            draw.text(
+                (panel_left - 8, panel_top - 5),
+                f"{y_max:.2g}",
+                font=small_font,
+                fill=(17, 24, 39),
+                anchor="ra",
+            )
+            draw.text(
+                (panel_left - 8, panel_bottom - 8),
+                f"{y_min:.2g}",
+                font=small_font,
+                fill=(17, 24, 39),
+                anchor="ra",
+            )
+
+        overlay_draw.polygon(
+            band_polygon(
+                block,
+                "prediction_lower_2sigma",
+                "prediction_upper_2sigma",
+                panel_left,
+                panel_top,
+            ),
+            fill=(191, 219, 254, 115),
+        )
+        overlay_draw.polygon(
+            band_polygon(
+                block,
+                "prediction_lower_1sigma",
+                "prediction_upper_1sigma",
+                panel_left,
+                panel_top,
+            ),
+            fill=(96, 165, 250, 135),
+        )
+        target_points = line_points(block, "target_y", panel_left, panel_top)
+        mean_points = line_points(block, "prediction_mean", panel_left, panel_top)
+        draw.line(target_points, fill=(0, 0, 0), width=3, joint="curve")
+        draw.line(mean_points, fill=(37, 99, 235), width=2, joint="curve")
+        for x, y in train_points:
+            px = sx(x, panel_left)
+            py = sy(y, panel_top)
+            draw.ellipse(
+                (px - 3, py - 3, px + 3, py + 3),
+                fill=(22, 163, 74),
+                outline=(20, 83, 45),
+                width=1,
+            )
+        for x, y in test_points:
+            px = sx(x, panel_left)
+            py = sy(y, panel_top)
+            draw.ellipse(
+                (px - 3, py - 3, px + 3, py + 3),
+                fill=(250, 204, 21),
+                outline=(113, 63, 18),
+                width=1,
+            )
+
+    image = Image.alpha_composite(image.convert("RGBA"), overlay)
+    draw = ImageDraw.Draw(image)
+    for panel_index, block in enumerate(blocks):
+        row_index = panel_index // columns
+        col_index = panel_index % columns
+        panel_left = left + col_index * (panel_w + gap_x)
+        panel_top = top + row_index * (panel_h + gap_y)
+        target_points = line_points(block, "target_y", panel_left, panel_top)
+        mean_points = line_points(block, "prediction_mean", panel_left, panel_top)
+        draw.line(target_points, fill=(0, 0, 0), width=3, joint="curve")
+        draw.line(mean_points, fill=(37, 99, 235), width=2, joint="curve")
+        for x, y in train_points:
+            px = sx(x, panel_left)
+            py = sy(y, panel_top)
+            draw.ellipse(
+                (px - 3, py - 3, px + 3, py + 3),
+                fill=(22, 163, 74),
+                outline=(20, 83, 45),
+                width=1,
+            )
+        for x, y in test_points:
+            px = sx(x, panel_left)
+            py = sy(y, panel_top)
+            draw.ellipse(
+                (px - 3, py - 3, px + 3, py + 3),
+                fill=(250, 204, 21),
+                outline=(113, 63, 18),
+                width=1,
+            )
+
+    key_x = width - right + 34
+    key_y = top + 4
+    draw.rectangle((key_x, key_y, key_x + 24, key_y + 12), fill=(191, 219, 254))
+    draw.text((key_x + 32, key_y - 2), "2 sigma", font=font, fill=(17, 24, 39))
+    draw.rectangle((key_x, key_y + 24, key_x + 24, key_y + 36), fill=(96, 165, 250))
+    draw.text((key_x + 32, key_y + 22), "1 sigma", font=font, fill=(17, 24, 39))
+    draw.line((key_x, key_y + 56, key_x + 24, key_y + 56), fill=(37, 99, 235), width=2)
+    draw.text((key_x + 32, key_y + 49), "mean", font=font, fill=(17, 24, 39))
+    draw.line((key_x, key_y + 80, key_x + 24, key_y + 80), fill=(0, 0, 0), width=3)
+    draw.text((key_x + 32, key_y + 73), "target", font=font, fill=(17, 24, 39))
+    draw.ellipse((key_x, key_y + 100, key_x + 8, key_y + 108), fill=(22, 163, 74))
+    draw.text((key_x + 16, key_y + 96), "train", font=font, fill=(17, 24, 39))
+    draw.ellipse((key_x, key_y + 122, key_x + 8, key_y + 130), fill=(250, 204, 21))
+    draw.text((key_x + 16, key_y + 118), "test", font=font, fill=(17, 24, 39))
+    image.convert("RGB").save(png_path)
+
+    def svg_points(points: list[tuple[float, float]]) -> str:
+        return " ".join(f"{x:.2f},{y:.2f}" for x, y in points)
+
+    def svg_band(
+        block: int,
+        lower_field: str,
+        upper_field: str,
+        panel_left: float,
+        panel_top: float,
+    ) -> str:
+        return svg_points(band_polygon(block, lower_field, upper_field, panel_left, panel_top))
+
+    svg = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="white"/>',
+        '<style>text{font-family:Arial,Helvetica,sans-serif;fill:#111827}.title{font-size:22px;font-weight:700}.label{font-size:14px;font-weight:700}.tick{font-size:11px}.legend{font-size:12px}.grid{stroke:#e5e7eb;stroke-width:1}.axis{stroke:#111827;stroke-width:1}</style>',
+        f'<text class="title" x="{left}" y="34">Prediction Distribution by Initial Noise</text>',
+    ]
+    for panel_index, block in enumerate(blocks):
+        row_index = panel_index // columns
+        col_index = panel_index % columns
+        panel_left = left + col_index * (panel_w + gap_x)
+        panel_top = top + row_index * (panel_h + gap_y)
+        panel_right = panel_left + panel_w
+        panel_bottom = panel_top + panel_h
+        for tick in range(4):
+            yy = panel_top + tick * panel_h / 3
+            svg.append(
+                f'<line class="grid" x1="{panel_left}" y1="{yy:.2f}" x2="{panel_right}" y2="{yy:.2f}"/>'
+            )
+            xx = panel_left + tick * panel_w / 3
+            svg.append(
+                f'<line class="grid" x1="{xx:.2f}" y1="{panel_top}" x2="{xx:.2f}" y2="{panel_bottom}"/>'
+            )
+        svg.append(
+            f'<rect class="axis" x="{panel_left}" y="{panel_top}" width="{panel_w}" height="{panel_h}" fill="none"/>'
+        )
+        svg.append(
+            f'<text class="label" x="{panel_left + 6}" y="{panel_top + 18}">block {block}</text>'
+        )
+        svg.append(
+            f'<polygon points="{svg_band(block, "prediction_lower_2sigma", "prediction_upper_2sigma", panel_left, panel_top)}" fill="#bfdbfe" opacity="0.45"/>'
+        )
+        svg.append(
+            f'<polygon points="{svg_band(block, "prediction_lower_1sigma", "prediction_upper_1sigma", panel_left, panel_top)}" fill="#60a5fa" opacity="0.55"/>'
+        )
+        svg.append(
+            f'<polyline points="{svg_points(line_points(block, "target_y", panel_left, panel_top))}" fill="none" stroke="#000000" stroke-width="3"/>'
+        )
+        svg.append(
+            f'<polyline points="{svg_points(line_points(block, "prediction_mean", panel_left, panel_top))}" fill="none" stroke="#2563eb" stroke-width="2"/>'
+        )
+        for x, y in train_points:
+            svg.append(
+                f'<circle cx="{sx(x, panel_left):.2f}" cy="{sy(y, panel_top):.2f}" r="3" fill="#16a34a" stroke="#14532d" stroke-width="0.8"/>'
+            )
+        for x, y in test_points:
+            svg.append(
+                f'<circle cx="{sx(x, panel_left):.2f}" cy="{sy(y, panel_top):.2f}" r="3" fill="#facc15" stroke="#713f12" stroke-width="0.8"/>'
+            )
+    key_x = width - right + 34
+    key_y = top + 4
+    svg.extend(
+        [
+            f'<rect x="{key_x}" y="{key_y}" width="24" height="12" fill="#bfdbfe" opacity="0.75"/>',
+            f'<text class="legend" x="{key_x + 32}" y="{key_y + 10}">2 sigma</text>',
+            f'<rect x="{key_x}" y="{key_y + 24}" width="24" height="12" fill="#60a5fa" opacity="0.85"/>',
+            f'<text class="legend" x="{key_x + 32}" y="{key_y + 34}">1 sigma</text>',
+            f'<line x1="{key_x}" y1="{key_y + 56}" x2="{key_x + 24}" y2="{key_y + 56}" stroke="#2563eb" stroke-width="2"/>',
+            f'<text class="legend" x="{key_x + 32}" y="{key_y + 60}">mean</text>',
+            f'<line x1="{key_x}" y1="{key_y + 80}" x2="{key_x + 24}" y2="{key_y + 80}" stroke="#000000" stroke-width="3"/>',
+            f'<text class="legend" x="{key_x + 32}" y="{key_y + 84}">target</text>',
+            f'<circle cx="{key_x + 4}" cy="{key_y + 104}" r="4" fill="#16a34a" stroke="#14532d" stroke-width="0.8"/>',
+            f'<text class="legend" x="{key_x + 16}" y="{key_y + 108}">train</text>',
+            f'<circle cx="{key_x + 4}" cy="{key_y + 126}" r="4" fill="#facc15" stroke="#713f12" stroke-width="0.8"/>',
+            f'<text class="legend" x="{key_x + 16}" y="{key_y + 130}">test</text>',
+        ]
+    )
+    svg.append("</svg>")
+    with open(svg_path, "w") as f:
+        f.write("\n".join(svg))
+        f.write("\n")
+    return True
 
 
 def write_eval_cycle_rmse_plot(
@@ -901,6 +1766,7 @@ def write_eval_cycle_latent_distance_plot(
     history: list[dict],
     png_path: str,
     svg_path: str,
+    split: str,
 ) -> bool:
     try:
         import matplotlib as mpl
@@ -909,8 +1775,9 @@ def write_eval_cycle_latent_distance_plot(
         return False
 
     rows = []
+    block_rows_key = f"{split}_block_rows"
     for item in history:
-        for row in item.get("test_block_rows", []):
+        for row in item.get(block_rows_key, []):
             rows.append(
                 {
                     "epoch": int(item["epoch"]),
@@ -922,6 +1789,7 @@ def write_eval_cycle_latent_distance_plot(
     if not rows:
         return False
 
+    split_title = split.capitalize()
     epochs = sorted({row["epoch"] for row in rows})
     norm = mpl.colors.Normalize(vmin=min(epochs), vmax=max(epochs))
     cmap = plt.get_cmap("viridis")
@@ -941,8 +1809,8 @@ def write_eval_cycle_latent_distance_plot(
             color=cmap(norm(epoch)),
         )
     ax.set_xlabel("Block index")
-    ax.set_ylabel("Test sequential latent RMSE to clean")
-    ax.set_title("Test Latent Distance by Block Across Eval Cycles")
+    ax.set_ylabel(f"{split_title} sequential latent RMSE to clean")
+    ax.set_title(f"{split_title} Latent Distance by Block Across Eval Cycles")
     ax.grid(True, alpha=0.25)
     sm = mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
     sm.set_array([])
@@ -1734,6 +2602,7 @@ def train(config: ToyConfig):
                     {
                         "epoch": epoch,
                         "block_index": block_index,
+                        "block_objective": model.block_objective(block_index),
                         "sigma": float(sigmas[block_index].detach().cpu()),
                         "train_loss": float(per_block_loss[block_index]),
                         "train_mse_loss": float(per_block_mse_loss[block_index]),
@@ -1776,6 +2645,11 @@ def train(config: ToyConfig):
     run_dir = os.path.join(config.output_dir, timestamp)
     os.makedirs(run_dir, exist_ok=True)
 
+    prediction_uncertainty_rows = evaluate_prediction_uncertainty(
+        model,
+        config,
+        sigmas,
+    )
     final_rows = history[-1]["train_block_rows"] + history[-1]["test_block_rows"]
     config_path = os.path.join(run_dir, "config.json")
     metrics_path = os.path.join(run_dir, "metrics.json")
@@ -1790,6 +2664,10 @@ def train(config: ToyConfig):
     eval_cycle_latent_csv_path = os.path.join(
         run_dir,
         "test_latent_distance_by_block_eval_cycles.csv",
+    )
+    train_eval_cycle_latent_csv_path = os.path.join(
+        run_dir,
+        "train_latent_distance_by_block_eval_cycles.csv",
     )
     eval_cycle_png_path = os.path.join(
         run_dir,
@@ -1806,6 +2684,14 @@ def train(config: ToyConfig):
     eval_cycle_latent_svg_path = os.path.join(
         run_dir,
         "test_latent_distance_by_block_eval_cycles.svg",
+    )
+    train_eval_cycle_latent_png_path = os.path.join(
+        run_dir,
+        "train_latent_distance_by_block_eval_cycles.png",
+    )
+    train_eval_cycle_latent_svg_path = os.path.join(
+        run_dir,
+        "train_latent_distance_by_block_eval_cycles.svg",
     )
     train_loss_csv_path = os.path.join(
         run_dir,
@@ -1831,6 +2717,18 @@ def train(config: ToyConfig):
         run_dir,
         "prediction_curves_by_block_eval_cycles.svg",
     )
+    prediction_uncertainty_csv_path = os.path.join(
+        run_dir,
+        "prediction_uncertainty_by_block.csv",
+    )
+    prediction_uncertainty_png_path = os.path.join(
+        run_dir,
+        "prediction_uncertainty_by_block.png",
+    )
+    prediction_uncertainty_svg_path = os.path.join(
+        run_dir,
+        "prediction_uncertainty_by_block.svg",
+    )
 
     with open(config_path, "w") as f:
         json.dump(asdict(config), f, indent=2, sort_keys=True)
@@ -1848,16 +2746,31 @@ def train(config: ToyConfig):
         f.write("\n")
     write_rows_csv(final_rows, csv_path)
     write_eval_cycle_rmse_csv(history, eval_cycle_csv_path)
-    write_eval_cycle_latent_distance_csv(history, eval_cycle_latent_csv_path)
+    write_eval_cycle_latent_distance_csv(
+        history,
+        eval_cycle_latent_csv_path,
+        "test",
+    )
+    write_eval_cycle_latent_distance_csv(
+        history,
+        train_eval_cycle_latent_csv_path,
+        "train",
+    )
     write_eval_cycle_train_loss_csv(history, train_loss_csv_path)
     write_prediction_curve_csv(history, prediction_curve_csv_path)
+    write_prediction_uncertainty_csv(
+        prediction_uncertainty_rows,
+        prediction_uncertainty_csv_path,
+    )
     wrote_block_plot = False
     wrote_latent_plot = False
     wrote_pred_plot = False
     wrote_eval_cycle_plot = False
     wrote_eval_cycle_latent_plot = False
+    wrote_train_eval_cycle_latent_plot = False
     wrote_train_loss_plot = False
     wrote_prediction_curve_plot = False
+    wrote_prediction_uncertainty_plot = False
     if not config.no_plots:
         wrote_eval_cycle_plot = write_eval_cycle_rmse_plot(
             history,
@@ -1868,6 +2781,13 @@ def train(config: ToyConfig):
             history,
             eval_cycle_latent_png_path,
             eval_cycle_latent_svg_path,
+            "test",
+        )
+        wrote_train_eval_cycle_latent_plot = write_eval_cycle_latent_distance_plot(
+            history,
+            train_eval_cycle_latent_png_path,
+            train_eval_cycle_latent_svg_path,
+            "train",
         )
         wrote_train_loss_plot = write_eval_cycle_train_loss_plot(
             history,
@@ -1880,6 +2800,13 @@ def train(config: ToyConfig):
             test_data,
             prediction_curve_png_path,
             prediction_curve_svg_path,
+        )
+        wrote_prediction_uncertainty_plot = write_prediction_uncertainty_plot(
+            prediction_uncertainty_rows,
+            train_data,
+            test_data,
+            prediction_uncertainty_png_path,
+            prediction_uncertainty_svg_path,
         )
         wrote_block_plot = write_plot(final_rows, plot_path)
         wrote_latent_plot = write_latent_distance_plot(final_rows, latent_plot_path)
@@ -1897,8 +2824,13 @@ def train(config: ToyConfig):
     print(f"Wrote {csv_path}")
     print(f"Wrote {eval_cycle_csv_path}")
     print(f"Wrote {eval_cycle_latent_csv_path}")
+    print(f"Wrote {train_eval_cycle_latent_csv_path}")
     print(f"Wrote {train_loss_csv_path}")
     print(f"Wrote {prediction_curve_csv_path}")
+    if prediction_uncertainty_rows:
+        print(f"Wrote {prediction_uncertainty_csv_path}")
+    else:
+        print("Skipped prediction uncertainty CSV because no samples were requested")
     if config.no_plots:
         print("Skipped plots because --no_plots was set")
     elif wrote_block_plot:
@@ -1921,7 +2853,12 @@ def train(config: ToyConfig):
         print(f"Wrote {eval_cycle_latent_png_path}")
         print(f"Wrote {eval_cycle_latent_svg_path}")
     else:
-        print("Skipped eval-cycle latent-distance plot because matplotlib is not installed")
+        print("Skipped test eval-cycle latent-distance plot because matplotlib is not installed")
+    if wrote_train_eval_cycle_latent_plot:
+        print(f"Wrote {train_eval_cycle_latent_png_path}")
+        print(f"Wrote {train_eval_cycle_latent_svg_path}")
+    else:
+        print("Skipped train eval-cycle latent-distance plot because matplotlib is not installed")
     if wrote_train_loss_plot:
         print(f"Wrote {train_loss_png_path}")
         print(f"Wrote {train_loss_svg_path}")
@@ -1932,6 +2869,11 @@ def train(config: ToyConfig):
         print(f"Wrote {prediction_curve_svg_path}")
     else:
         print("Skipped eval-cycle prediction plot because Pillow is not installed")
+    if wrote_prediction_uncertainty_plot:
+        print(f"Wrote {prediction_uncertainty_png_path}")
+        print(f"Wrote {prediction_uncertainty_svg_path}")
+    else:
+        print("Skipped prediction uncertainty plot because Pillow is not installed")
     if wrote_pred_plot:
         print(f"Wrote {pred_plot_path}")
     else:
@@ -1972,12 +2914,77 @@ def parse_args() -> ToyConfig:
         "--training_objective",
         type=str,
         default=ToyConfig.training_objective,
-        choices=["clean_latent", "residual_next_latent"],
+        choices=["clean_latent", "residual_next_latent", "residual_to_clean"],
         help=(
             "clean_latent keeps the original toy objective where each block "
             "predicts the clean latent; residual_next_latent makes each block "
             "predict delta_hat and applies z_next_hat = z + delta_hat toward "
-            "the next scheduled latent state"
+            "the next scheduled latent state; residual_to_clean makes each "
+            "block predict r_hat = z_clean - z and updates with "
+            "z_next = z + alpha * r_hat"
+        ),
+    )
+    parser.add_argument(
+        "--block_objective_pattern",
+        type=str,
+        default=ToyConfig.block_objective_pattern,
+        choices=[
+            "global",
+            "all_prediction",
+            "all_residual",
+            "first_prediction_then_residual",
+            "alternating_prediction_residual",
+        ],
+        help=(
+            "per-block training objective schedule; global preserves "
+            "--training_objective, all_prediction trains every block with "
+            "decoded prediction MSE, all_residual trains every block with "
+            "residual-next-latent loss, first_prediction_then_residual trains "
+            "block 0 with prediction loss and later blocks with residual loss, "
+            "and alternating_prediction_residual uses prediction loss on even "
+            "blocks and residual loss on odd blocks"
+        ),
+    )
+    parser.add_argument(
+        "--denoising_target",
+        type=str,
+        default=ToyConfig.denoising_target,
+        choices=["embedding", "value"],
+        help=(
+            "space to denoise; embedding uses target_encoder/target_decoder, "
+            "value denoises the scalar function value directly"
+        ),
+    )
+    parser.add_argument(
+        "--residual_next_latent_training_mode",
+        type=str,
+        default=ToyConfig.residual_next_latent_training_mode,
+        choices=["sequential", "independent"],
+        help=(
+            "training mode for residual objectives; sequential rolls the "
+            "denoising chain forward, independent trains each block from "
+            "z_clean + sigma * epsilon"
+        ),
+    )
+    parser.add_argument(
+        "--initial_noise_mode",
+        type=str,
+        default=ToyConfig.initial_noise_mode,
+        choices=["per_example", "shared_per_batch", "fixed_shared"],
+        help=(
+            "initial sequential denoising noise mode; per_example samples one "
+            "noise vector per input, shared_per_batch samples one vector per "
+            "batch and shares it across inputs, fixed_shared reuses one seeded "
+            "vector for all inputs and calls"
+        ),
+    )
+    parser.add_argument(
+        "--initial_noise_std",
+        type=float,
+        default=ToyConfig.initial_noise_std,
+        help=(
+            "std for the initial sequential denoising state; defaults to "
+            "sqrt(1 + sigma[0]^2) when unset"
         ),
     )
     parser.add_argument(
@@ -2014,6 +3021,15 @@ def parse_args() -> ToyConfig:
         type=int,
         default=ToyConfig.prediction_grid_points,
     )
+    parser.add_argument(
+        "--prediction_uncertainty_samples",
+        type=int,
+        default=ToyConfig.prediction_uncertainty_samples,
+        help=(
+            "number of random initial-noise draws for the final prediction "
+            "uncertainty plot; set to 0 to skip"
+        ),
+    )
     parser.add_argument("--device", type=str, default=ToyConfig.device)
     parser.add_argument("--no_plots", action="store_true")
     args = parser.parse_args()
@@ -2026,12 +3042,41 @@ def parse_args() -> ToyConfig:
         raise ValueError("--sigma_min must be smaller than --sigma_max")
     if config.prediction_grid_points < 2:
         raise ValueError("--prediction_grid_points must be at least 2")
+    if config.prediction_uncertainty_samples < 0:
+        raise ValueError("--prediction_uncertainty_samples must be non-negative")
     if config.observation_noise_std < 0.0:
         raise ValueError("--observation_noise_std must be non-negative")
+    if config.initial_noise_std is not None and config.initial_noise_std < 0.0:
+        raise ValueError("--initial_noise_std must be non-negative when set")
     if config.prediction_loss_weight < 0.0:
         raise ValueError("--prediction_loss_weight must be non-negative")
     if config.latent_loss_weight < 0.0:
         raise ValueError("--latent_loss_weight must be non-negative")
+    if (
+        config.training_objective
+        not in ["residual_next_latent", "residual_to_clean"]
+        and config.residual_next_latent_training_mode != "sequential"
+    ):
+        raise ValueError(
+            "--residual_next_latent_training_mode independent requires a "
+            "residual --training_objective"
+        )
+    if (
+        config.block_objective_pattern != "global"
+        and config.residual_next_latent_training_mode != "sequential"
+    ):
+        raise ValueError(
+            "--block_objective_pattern values other than global currently "
+            "require --residual_next_latent_training_mode sequential"
+        )
+    if (
+        config.denoising_target == "value"
+        and config.train_encoder_with_prediction_loss_only
+    ):
+        raise ValueError(
+            "--train_encoder_with_prediction_loss_only requires "
+            "--denoising_target embedding"
+        )
     return config
 
 

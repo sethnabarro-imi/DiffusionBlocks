@@ -209,15 +209,35 @@ results/toy_1d_regression/<timestamp>/blockwise_rmse.png
 results/toy_1d_regression/<timestamp>/predictions_by_block.png
 results/toy_1d_regression/<timestamp>/test_rmse_by_block_eval_cycles.csv
 results/toy_1d_regression/<timestamp>/test_rmse_by_block_eval_cycles.png
+results/toy_1d_regression/<timestamp>/test_latent_distance_by_block_eval_cycles.csv
+results/toy_1d_regression/<timestamp>/test_latent_distance_by_block_eval_cycles.png
+results/toy_1d_regression/<timestamp>/test_latent_distance_by_block_eval_cycles.svg
+results/toy_1d_regression/<timestamp>/train_latent_distance_by_block_eval_cycles.csv
+results/toy_1d_regression/<timestamp>/train_latent_distance_by_block_eval_cycles.png
+results/toy_1d_regression/<timestamp>/train_latent_distance_by_block_eval_cycles.svg
 results/toy_1d_regression/<timestamp>/train_loss_by_block_eval_cycles.csv
 results/toy_1d_regression/<timestamp>/train_loss_by_block_eval_cycles.png
 results/toy_1d_regression/<timestamp>/train_loss_by_block_eval_cycles.svg
 results/toy_1d_regression/<timestamp>/prediction_curves_by_block_eval_cycles.csv
 results/toy_1d_regression/<timestamp>/prediction_curves_by_block_eval_cycles.png
+results/toy_1d_regression/<timestamp>/prediction_uncertainty_by_block.csv
+results/toy_1d_regression/<timestamp>/prediction_uncertainty_by_block.png
+results/toy_1d_regression/<timestamp>/prediction_uncertainty_by_block.svg
 ```
 
 Use `--observation_noise_std` to add Gaussian observation noise to both train
 and test targets. The old `--target_noise_std` name is kept as an alias.
+Use `--initial_noise_std 1.0` to make the initial sequential denoising state
+standard normal; when omitted, it uses the previous default
+`sqrt(1 + sigma[0]^2)` scaling.
+Use `--block_objective_pattern first_prediction_then_residual` to train block
+0 with decoded prediction MSE and every later block with residual-next-latent
+loss. Use `--block_objective_pattern alternating_prediction_residual` to train
+even-indexed blocks with prediction loss and odd-indexed blocks with residual
+loss.
+Use `--prediction_uncertainty_samples` to control how many random initial-noise
+draws are used for the final per-block Gaussian prediction interval plot; the
+default is 50, and 0 skips it.
 
 ## Evaluation
 
