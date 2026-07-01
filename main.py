@@ -522,15 +522,18 @@ def validate_args(args):
     if args.dblock_training_objective != "classification":
         if args.model_type != "dblock":
             raise ValueError("--dblock_training_objective is only supported for dblock")
-        if args.dblock_training_objective == "residual_next_latent":
+        if args.dblock_training_objective in [
+            "residual_next_latent",
+            "residual_to_clean",
+        ]:
             if not args.sequential_denoising_training:
                 raise ValueError(
-                    "--dblock_training_objective residual_next_latent requires "
+                    f"--dblock_training_objective {args.dblock_training_objective} requires "
                     "--sequential_denoising_training"
                 )
             if args.hybrid_block0_independent_training:
                 raise ValueError(
-                    "--dblock_training_objective residual_next_latent is not "
+                    f"--dblock_training_objective {args.dblock_training_objective} is not "
                     "currently supported with --hybrid_block0_independent_training"
                 )
     if args.data_name == "synthetic-teacher":
@@ -811,12 +814,14 @@ if __name__ == "__main__":
         "--dblock_training_objective",
         type=str,
         default="classification",
-        choices=["classification", "residual_next_latent"],
+        choices=["classification", "residual_next_latent", "residual_to_clean"],
         help=(
             "DBlock training objective. classification keeps the existing "
             "logit/clean-target denoising objective; residual_next_latent makes "
             "each block predict a hidden-size residual delta and applies "
-            "z_next_hat = z + delta_hat toward the next scheduled latent state"
+            "z_next_hat = z + delta_hat toward the next scheduled latent state; "
+            "residual_to_clean makes each block predict r_hat = z_clean - z "
+            "and updates with z_next = z + alpha * r_hat"
         ),
     )
     parser.add_argument(

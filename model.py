@@ -832,16 +832,20 @@ class ViTDBlockModel(ViTModel):
         if self.dblock_training_objective not in [
             "classification",
             "residual_next_latent",
+            "residual_to_clean",
         ]:
             raise ValueError(
                 f"Unsupported DBlock training objective: {self.dblock_training_objective}"
             )
         if (
-            self.dblock_training_objective == "residual_next_latent"
+            self.dblock_training_objective in [
+                "residual_next_latent",
+                "residual_to_clean",
+            ]
             and self.task_type != "classification"
         ):
             raise ValueError(
-                "--dblock_training_objective residual_next_latent currently "
+                f"--dblock_training_objective {self.dblock_training_objective} currently "
                 "requires classification targets"
             )
         self.trace_block_layers = getattr(self.args, "trace_block_layers", False)
@@ -941,7 +945,10 @@ class ViTDBlockModel(ViTModel):
 
     def configure_model(self):
         architecture_kwargs = self.architecture_kwargs()
-        if self.dblock_training_objective == "residual_next_latent":
+        if self.dblock_training_objective in [
+            "residual_next_latent",
+            "residual_to_clean",
+        ]:
             architecture_kwargs["latent_prediction_head"] = True
         self.model = load_vit(
             image_size=self.image_size,
@@ -1137,6 +1144,22 @@ class ViTDBlockModel(ViTModel):
     def uses_residual_next_latent_objective(self) -> bool:
         return self.dblock_training_objective == "residual_next_latent"
 
+    def uses_residual_to_clean_objective(self) -> bool:
+        return self.dblock_training_objective == "residual_to_clean"
+
+    def uses_residual_latent_objective(self) -> bool:
+        return self.dblock_training_objective in [
+            "residual_next_latent",
+            "residual_to_clean",
+        ]
+
+    def residual_update_alpha(
+        self,
+        sigma: torch.Tensor,
+        next_sigma: torch.Tensor,
+    ) -> torch.Tensor:
+        return 1.0 - next_sigma / sigma
+
     def logits_from_latent(self, latent: torch.Tensor) -> torch.Tensor:
         label_embeddings = self.normalize_embeddings(
             self.model.get_input_embeddings().weight
@@ -1186,7 +1209,7 @@ class ViTDBlockModel(ViTModel):
         conditioning = outputs.conditioning
         model_out = hidden_states * c_out[:, None] + zt * c_skip[:, None]
         latent_delta = None
-        if self.uses_residual_next_latent_objective():
+        if self.uses_residual_latent_objective():
             latent_delta = self.model.forward_latent_delta(
                 hidden_states.unsqueeze(1), conditioning
             )
@@ -1201,7 +1224,7 @@ class ViTDBlockModel(ViTModel):
         if self.task_type == "regression":
             model_out = self.apply_classifier_free_guidance(model_out)
         if not return_layer_logits:
-            if self.task_type == "regression" or self.uses_residual_next_latent_objective():
+            if self.task_type == "regression" or self.uses_residual_latent_objective():
                 if latent_delta is not None:
                     return {
                         "logits": logits,
@@ -1216,7 +1239,7 @@ class ViTDBlockModel(ViTModel):
         layer_latent_deltas = []
         for layer_hidden_states in outputs.hidden_states[1:]:
             layer_hidden_states = self.pool_hidden_states(layer_hidden_states)
-            if self.uses_residual_next_latent_objective():
+            if self.uses_residual_latent_objective():
                 layer_delta = self.model.forward_latent_delta(
                     layer_hidden_states.unsqueeze(1), conditioning
                 )
@@ -1235,7 +1258,7 @@ class ViTDBlockModel(ViTModel):
             layer_logits.append(layer_logit)
             if self.task_type == "regression":
                 layer_latents.append(self.apply_classifier_free_guidance(layer_model_out))
-            elif self.uses_residual_next_latent_objective():
+            elif self.uses_residual_latent_objective():
                 layer_latents.append(layer_model_out)
         result = {
             "logits": logits,
@@ -1247,7 +1270,7 @@ class ViTDBlockModel(ViTModel):
         if self.task_type == "regression":
             result["latent"] = model_out
             result["layer_latents"] = torch.stack(layer_latents)
-        if self.uses_residual_next_latent_objective():
+        if self.uses_residual_latent_objective():
             result["latent"] = model_out
             result["latent_delta"] = latent_delta
             result["layer_latents"] = torch.stack(layer_latents)
@@ -1982,7 +2005,7 @@ class ViTDBlockModel(ViTModel):
             if not isinstance(denoise_output, dict):
                 raise ValueError("Regression denoise output must include a latent")
             return denoise_output["latent"]
-        if self.uses_residual_next_latent_objective():
+        if self.uses_residual_latent_objective():
             if not isinstance(denoise_output, dict):
                 raise ValueError("Residual denoise output must include a latent")
             return denoise_output["latent"]
@@ -2091,6 +2114,12 @@ class ViTDBlockModel(ViTModel):
     ):
         if self.uses_residual_next_latent_objective():
             return self.residual_next_latent_training_step(
+                pixel_values,
+                labels,
+                step=step,
+            )
+        if self.uses_residual_to_clean_objective():
+            return self.residual_to_clean_training_step(
                 pixel_values,
                 labels,
                 step=step,
@@ -2213,6 +2242,79 @@ class ViTDBlockModel(ViTModel):
             loss_dict[f"{step}/ce_loss_{block_idx}"] = ce_loss
 
             z = z_input + latent_delta.detach()
+
+        return self.aggregate_denoising_losses(losses, ce_losses, loss_dict, step)
+
+    def residual_to_clean_training_step(
+        self,
+        pixel_values: torch.Tensor,
+        labels: torch.Tensor,
+        step: str = "train",
+    ):
+        batch_size = pixel_values.shape[0]
+        hidden_size = self.model.config.hidden_size
+        labels = labels.view(-1)
+        z_clean = self.get_target_latents(labels)
+        z = self.sample_epsilon(
+            (batch_size, hidden_size),
+            device=pixel_values.device,
+            dtype=pixel_values.dtype,
+        )
+        z = z * torch.sqrt(1.0 + self.sigmas[0].to(z) ** 2.0)
+        s_in = pixel_values.new_ones([batch_size])
+
+        losses = []
+        ce_losses = []
+        loss_dict = {}
+
+        for step_index in range(self.sigmas.shape[0]):
+            sigma = self.sigmas[step_index] * s_in
+            next_sigma = (
+                self.sigmas[step_index + 1] * s_in
+                if step_index < self.sigmas.shape[0] - 1
+                else torch.zeros_like(sigma)
+            )
+            block_idx = self.estimate_target_layer(sigma)
+            z_input = z.detach()
+            denoise_output = self.denoise(
+                pixel_values,
+                z_input,
+                sigma,
+                block_idx=block_idx,
+            )
+            residual_pred = self.latent_delta_from_denoise_output(denoise_output)
+            residual_target = z_clean - z_input
+            per_example_loss = F.mse_loss(
+                residual_pred,
+                residual_target,
+                reduction="none",
+            ).mean(dim=-1)
+            residual_loss = per_example_loss.mean()
+            logits = self.prediction_from_denoise_output(denoise_output)
+            ce_loss = self.per_example_classification_loss(
+                logits,
+                labels,
+                loss_type="cross_entropy",
+            ).mean()
+
+            losses.append(residual_loss)
+            ce_losses.append(ce_loss)
+            loss_dict[f"{step}/loss_step_{step_index}"] = residual_loss
+            loss_dict[f"{step}/residual_to_clean_mse_step_{step_index}"] = (
+                residual_loss
+            )
+            loss_dict[f"{step}/ce_loss_step_{step_index}"] = ce_loss
+            loss_dict[f"{step}/loss_block_{block_idx}"] = residual_loss
+            loss_dict[f"{step}/residual_to_clean_mse_block_{block_idx}"] = (
+                residual_loss
+            )
+            loss_dict[f"{step}/ce_loss_block_{block_idx}"] = ce_loss
+            loss_dict[f"{step}/loss_{block_idx}"] = residual_loss
+            loss_dict[f"{step}/residual_to_clean_mse_{block_idx}"] = residual_loss
+            loss_dict[f"{step}/ce_loss_{block_idx}"] = ce_loss
+
+            alpha = self.residual_update_alpha(sigma, next_sigma)
+            z = z_input + alpha[:, None] * residual_pred.detach()
 
         return self.aggregate_denoising_losses(losses, ce_losses, loss_dict, step)
 
@@ -2461,6 +2563,10 @@ class ViTDBlockModel(ViTModel):
                     )
             if self.uses_residual_next_latent_objective():
                 z = self.latent_from_denoise_output(denoise_output)
+            elif self.uses_residual_to_clean_objective():
+                residual_pred = self.latent_delta_from_denoise_output(denoise_output)
+                alpha = self.residual_update_alpha(sigma, next_sigma)
+                z = z + alpha[:, None] * residual_pred
             else:
                 denoised = self.latent_from_denoise_output(denoise_output)
                 # to d
