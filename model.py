@@ -829,6 +829,36 @@ class ViTDBlockModel(ViTModel):
         self.dblock_training_objective = getattr(
             self.args, "dblock_training_objective", "classification"
         )
+        self.dblock_residual_readout_type = getattr(
+            self.args, "dblock_residual_readout_type", "classifier"
+        )
+        if self.dblock_residual_readout_type not in [
+            "classifier",
+            "label_embedding_cosine",
+        ]:
+            raise ValueError(
+                "--dblock_residual_readout_type must be one of "
+                "classifier or label_embedding_cosine"
+            )
+        self.dblock_latent_loss_weight = getattr(
+            self.args, "dblock_latent_loss_weight", 1.0
+        )
+        self.dblock_prediction_loss_weight = getattr(
+            self.args, "dblock_prediction_loss_weight", 1.0
+        )
+        if self.dblock_latent_loss_weight < 0.0:
+            raise ValueError("--dblock_latent_loss_weight must be non-negative")
+        if self.dblock_prediction_loss_weight < 0.0:
+            raise ValueError("--dblock_prediction_loss_weight must be non-negative")
+        if (
+            self.dblock_training_objective != "classification"
+            and self.dblock_latent_loss_weight == 0.0
+            and self.dblock_prediction_loss_weight == 0.0
+        ):
+            raise ValueError(
+                "at least one of --dblock_latent_loss_weight or "
+                "--dblock_prediction_loss_weight must be positive"
+            )
         if self.dblock_training_objective not in [
             "classification",
             "residual_next_latent",
@@ -925,6 +955,9 @@ class ViTDBlockModel(ViTModel):
                 "cosine_classifier_scale": self.cosine_classifier_scale,
                 "one_hot_mse_top_k": self.one_hot_mse_top_k,
                 "dblock_training_objective": self.dblock_training_objective,
+                "dblock_residual_readout_type": self.dblock_residual_readout_type,
+                "dblock_latent_loss_weight": self.dblock_latent_loss_weight,
+                "dblock_prediction_loss_weight": self.dblock_prediction_loss_weight,
                 "sequential_denoising_training": (
                     self.sequential_denoising_training
                 ),
@@ -1161,6 +1194,12 @@ class ViTDBlockModel(ViTModel):
         return 1.0 - next_sigma / sigma
 
     def logits_from_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        if (
+            self.uses_residual_latent_objective()
+            and self.dblock_residual_readout_type == "classifier"
+        ):
+            return self.model.classifier(latent)
+
         label_embeddings = self.normalize_embeddings(
             self.model.get_input_embeddings().weight
         )
@@ -2224,22 +2263,29 @@ class ViTDBlockModel(ViTModel):
                 labels,
                 loss_type="cross_entropy",
             ).mean()
+            weighted_loss = (
+                self.dblock_latent_loss_weight * residual_loss
+                + self.dblock_prediction_loss_weight * ce_loss
+            )
 
-            losses.append(residual_loss)
+            losses.append(weighted_loss)
             ce_losses.append(ce_loss)
-            loss_dict[f"{step}/loss_step_{step_index}"] = residual_loss
+            loss_dict[f"{step}/loss_step_{step_index}"] = weighted_loss
             loss_dict[f"{step}/residual_next_latent_mse_step_{step_index}"] = (
                 residual_loss
             )
             loss_dict[f"{step}/ce_loss_step_{step_index}"] = ce_loss
-            loss_dict[f"{step}/loss_block_{block_idx}"] = residual_loss
+            loss_dict[f"{step}/weighted_loss_step_{step_index}"] = weighted_loss
+            loss_dict[f"{step}/loss_block_{block_idx}"] = weighted_loss
             loss_dict[f"{step}/residual_next_latent_mse_block_{block_idx}"] = (
                 residual_loss
             )
             loss_dict[f"{step}/ce_loss_block_{block_idx}"] = ce_loss
-            loss_dict[f"{step}/loss_{block_idx}"] = residual_loss
+            loss_dict[f"{step}/weighted_loss_block_{block_idx}"] = weighted_loss
+            loss_dict[f"{step}/loss_{block_idx}"] = weighted_loss
             loss_dict[f"{step}/residual_next_latent_mse_{block_idx}"] = residual_loss
             loss_dict[f"{step}/ce_loss_{block_idx}"] = ce_loss
+            loss_dict[f"{step}/weighted_loss_{block_idx}"] = weighted_loss
 
             z = z_input + latent_delta.detach()
 
@@ -2296,22 +2342,29 @@ class ViTDBlockModel(ViTModel):
                 labels,
                 loss_type="cross_entropy",
             ).mean()
+            weighted_loss = (
+                self.dblock_latent_loss_weight * residual_loss
+                + self.dblock_prediction_loss_weight * ce_loss
+            )
 
-            losses.append(residual_loss)
+            losses.append(weighted_loss)
             ce_losses.append(ce_loss)
-            loss_dict[f"{step}/loss_step_{step_index}"] = residual_loss
+            loss_dict[f"{step}/loss_step_{step_index}"] = weighted_loss
             loss_dict[f"{step}/residual_to_clean_mse_step_{step_index}"] = (
                 residual_loss
             )
             loss_dict[f"{step}/ce_loss_step_{step_index}"] = ce_loss
-            loss_dict[f"{step}/loss_block_{block_idx}"] = residual_loss
+            loss_dict[f"{step}/weighted_loss_step_{step_index}"] = weighted_loss
+            loss_dict[f"{step}/loss_block_{block_idx}"] = weighted_loss
             loss_dict[f"{step}/residual_to_clean_mse_block_{block_idx}"] = (
                 residual_loss
             )
             loss_dict[f"{step}/ce_loss_block_{block_idx}"] = ce_loss
-            loss_dict[f"{step}/loss_{block_idx}"] = residual_loss
+            loss_dict[f"{step}/weighted_loss_block_{block_idx}"] = weighted_loss
+            loss_dict[f"{step}/loss_{block_idx}"] = weighted_loss
             loss_dict[f"{step}/residual_to_clean_mse_{block_idx}"] = residual_loss
             loss_dict[f"{step}/ce_loss_{block_idx}"] = ce_loss
+            loss_dict[f"{step}/weighted_loss_{block_idx}"] = weighted_loss
 
             alpha = self.residual_update_alpha(sigma, next_sigma)
             z = z_input + alpha[:, None] * residual_pred.detach()

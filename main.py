@@ -522,6 +522,18 @@ def validate_args(args):
     if args.dblock_training_objective != "classification":
         if args.model_type != "dblock":
             raise ValueError("--dblock_training_objective is only supported for dblock")
+        if args.dblock_latent_loss_weight < 0.0:
+            raise ValueError("--dblock_latent_loss_weight must be non-negative")
+        if args.dblock_prediction_loss_weight < 0.0:
+            raise ValueError("--dblock_prediction_loss_weight must be non-negative")
+        if (
+            args.dblock_latent_loss_weight == 0.0
+            and args.dblock_prediction_loss_weight == 0.0
+        ):
+            raise ValueError(
+                "at least one of --dblock_latent_loss_weight or "
+                "--dblock_prediction_loss_weight must be positive"
+            )
         if args.dblock_training_objective in [
             "residual_next_latent",
             "residual_to_clean",
@@ -822,6 +834,34 @@ if __name__ == "__main__":
             "z_next_hat = z + delta_hat toward the next scheduled latent state; "
             "residual_to_clean makes each block predict r_hat = z_clean - z "
             "and updates with z_next = z + alpha * r_hat"
+        ),
+    )
+    parser.add_argument(
+        "--dblock_residual_readout_type",
+        type=str,
+        default="classifier",
+        choices=["classifier", "label_embedding_cosine"],
+        help=(
+            "readout used for residual DBlock objectives. classifier applies the "
+            "configured classifier head to the predicted clean latent; with the "
+            "default --classifier_head_type linear this is a dense projection. "
+            "label_embedding_cosine keeps the previous cosine-similarity readout "
+            "against the learned label embedding table"
+        ),
+    )
+    parser.add_argument(
+        "--dblock_latent_loss_weight",
+        type=float,
+        default=1.0,
+        help="weight on residual latent MSE for residual DBlock objectives",
+    )
+    parser.add_argument(
+        "--dblock_prediction_loss_weight",
+        type=float,
+        default=1.0,
+        help=(
+            "weight on cross-entropy prediction loss for residual DBlock "
+            "objectives; set to 0 to recover latent-only residual training"
         ),
     )
     parser.add_argument(
