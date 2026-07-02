@@ -220,6 +220,10 @@ def write_eval_results(args, data, logdir, ckpt_path, split_results):
         "hybrid_block0_independent_training": getattr(
             args, "hybrid_block0_independent_training", False
         ),
+        "shared_denoising_block": getattr(args, "shared_denoising_block", False),
+        "shared_denoising_block_index": getattr(
+            args, "shared_denoising_block_index", 0
+        ),
         "trace_block_layers": getattr(args, "trace_block_layers", False),
         "trace_intermediate_predictions": (
             getattr(args, "trace_intermediate_predictions", False)
@@ -518,6 +522,16 @@ def validate_args(args):
     if args.hybrid_block0_independent_training and args.model_type != "dblock":
         raise ValueError(
             "--hybrid_block0_independent_training is only supported for dblock"
+        )
+    if args.shared_denoising_block and args.model_type != "dblock":
+        raise ValueError("--shared_denoising_block is only supported for dblock")
+    if args.num_blocks < 1:
+        raise ValueError("--num_blocks must be at least 1")
+    if args.shared_denoising_block_index < 0:
+        raise ValueError("--shared_denoising_block_index must be non-negative")
+    if args.shared_denoising_block_index >= args.num_blocks:
+        raise ValueError(
+            "--shared_denoising_block_index must be smaller than --num_blocks"
         )
     if args.dblock_training_objective != "classification":
         if args.model_type != "dblock":
@@ -820,6 +834,23 @@ if __name__ == "__main__":
             "noise objective, then feed its Euler-updated state into the "
             "sequential denoising chain for the remaining blocks; implies "
             "--sequential_denoising_training"
+        ),
+    )
+    parser.add_argument(
+        "--shared_denoising_block",
+        action="store_true",
+        help=(
+            "route every DBlock denoising/noise step through the same block "
+            "network instead of selecting a separate block by sigma; this "
+            "composes with sequential and residual DBlock objectives"
+        ),
+    )
+    parser.add_argument(
+        "--shared_denoising_block_index",
+        type=int,
+        default=0,
+        help=(
+            "which block network to reuse when --shared_denoising_block is set"
         ),
     )
     parser.add_argument(

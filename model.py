@@ -826,6 +826,18 @@ class ViTDBlockModel(ViTModel):
         self.hybrid_block0_independent_training = getattr(
             self.args, "hybrid_block0_independent_training", False
         )
+        self.shared_denoising_block = getattr(
+            self.args, "shared_denoising_block", False
+        )
+        self.shared_denoising_block_index = getattr(
+            self.args, "shared_denoising_block_index", 0
+        )
+        if self.shared_denoising_block_index < 0:
+            raise ValueError("--shared_denoising_block_index must be non-negative")
+        if self.shared_denoising_block_index >= self.args.num_blocks:
+            raise ValueError(
+                "--shared_denoising_block_index must be smaller than --num_blocks"
+            )
         self.dblock_training_objective = getattr(
             self.args, "dblock_training_objective", "classification"
         )
@@ -964,6 +976,8 @@ class ViTDBlockModel(ViTModel):
                 "hybrid_block0_independent_training": (
                     self.hybrid_block0_independent_training
                 ),
+                "shared_denoising_block": self.shared_denoising_block,
+                "shared_denoising_block_index": self.shared_denoising_block_index,
                 "cfg_scale": self.cfg_scale,
                 "class_dropout_prob": self.class_dropout_prob,
                 "trace_intermediate_predictions": self.trace_intermediate_predictions,
@@ -1160,7 +1174,14 @@ class ViTDBlockModel(ViTModel):
         )
         return epsilon.to(device=device, dtype=dtype)
 
+    def route_denoising_block_index(self, block_idx: int) -> int:
+        if self.shared_denoising_block:
+            return self.shared_denoising_block_index
+        return block_idx
+
     def estimate_target_layer(self, sigma: torch.Tensor) -> int:
+        if self.shared_denoising_block:
+            return self.shared_denoising_block_index
         block_sigmas = torch.tensor(self.block_sigmas, device=sigma.device)
         block_idx = torch.bucketize(sigma, block_sigmas, right=True) - 1
         block_idx = (self.args.num_blocks - 1) - block_idx
@@ -1220,6 +1241,8 @@ class ViTDBlockModel(ViTModel):
     def denoise(self, x, zt, sigma, block_idx=None, return_layer_logits=False):
         if block_idx is None:
             block_idx = self.estimate_target_layer(sigma)
+        else:
+            block_idx = self.route_denoising_block_index(block_idx)
         zt_for_update = zt
         if self.class_dropout_prob > 0.0 and self.training:
             drop_x = torch.rand(x.shape[0], device=x.device) < self.class_dropout_prob
@@ -2394,7 +2417,7 @@ class ViTDBlockModel(ViTModel):
         ce_losses = []
         loss_dict = {}
 
-        block_idx = 0
+        block_idx = self.route_denoising_block_index(0)
         denoise_output = self.denoise(pixel_values, z, sigma, block_idx=block_idx)
         logits = self.prediction_from_denoise_output(denoise_output)
         self.append_denoising_loss(

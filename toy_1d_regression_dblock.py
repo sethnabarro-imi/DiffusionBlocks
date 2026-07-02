@@ -43,6 +43,8 @@ class ToyConfig:
     block_objective_pattern: str = "global"
     denoising_target: str = "embedding"
     residual_next_latent_training_mode: str = "sequential"
+    shared_denoising_block: bool = False
+    shared_denoising_block_index: int = 0
     initial_noise_mode: str = "per_example"
     initial_noise_std: float | None = None
     train_encoder_with_prediction_loss_only: bool = False
@@ -228,6 +230,14 @@ class ToyDiffusionBlocks(nn.Module):
         weights[-1] = torch.maximum(weights[-1], weights.new_tensor(1.0))
         return weights
 
+    def network_block_index(self, block_index: int) -> int:
+        if self.config.shared_denoising_block:
+            return self.config.shared_denoising_block_index
+        return block_index
+
+    def denoising_block(self, block_index: int) -> DenoisingBlock:
+        return self.blocks[self.network_block_index(block_index)]
+
     def initial_noise(
         self,
         batch_size: int,
@@ -292,7 +302,8 @@ class ToyDiffusionBlocks(nn.Module):
 
         predictions = []
         latents = []
-        for block_index, block in enumerate(self.blocks):
+        for block_index in range(self.config.num_blocks):
+            block = self.denoising_block(block_index)
             sigma = sigmas[block_index].expand(batch_size)
             next_sigma = (
                 sigmas[block_index + 1].expand(batch_size)
@@ -335,7 +346,8 @@ class ToyDiffusionBlocks(nn.Module):
         z_clean = self.clean_latent(y)
         predictions = []
         latents = []
-        for block_index, block in enumerate(self.blocks):
+        for block_index in range(self.config.num_blocks):
+            block = self.denoising_block(block_index)
             sigma = sigmas[block_index].expand(x.shape[0])
             if noise is None:
                 epsilon = torch.randn_like(z_clean)
@@ -423,7 +435,8 @@ class ToyDiffusionBlocks(nn.Module):
         residual_losses = []
         per_block_losses = []
         encoder_prediction_losses = []
-        for block_index, block in enumerate(self.blocks):
+        for block_index in range(self.config.num_blocks):
+            block = self.denoising_block(block_index)
             sigma = sigmas[block_index].expand(batch_size)
             next_sigma = (
                 sigmas[block_index + 1].expand(batch_size)
@@ -510,7 +523,8 @@ class ToyDiffusionBlocks(nn.Module):
 
         predictions = []
         residual_losses = []
-        for block_index, block in enumerate(self.blocks):
+        for block_index in range(self.config.num_blocks):
+            block = self.denoising_block(block_index)
             sigma = sigmas[block_index].expand(batch_size)
             next_sigma = (
                 sigmas[block_index + 1].expand(batch_size)
@@ -570,7 +584,8 @@ class ToyDiffusionBlocks(nn.Module):
 
         predictions = []
         residual_losses = []
-        for block_index, block in enumerate(self.blocks):
+        for block_index in range(self.config.num_blocks):
+            block = self.denoising_block(block_index)
             sigma = sigmas[block_index].expand(x.shape[0])
             next_sigma = (
                 sigmas[block_index + 1].expand(x.shape[0])
@@ -639,7 +654,8 @@ class ToyDiffusionBlocks(nn.Module):
 
         predictions = []
         residual_losses = []
-        for block_index, block in enumerate(self.blocks):
+        for block_index in range(self.config.num_blocks):
+            block = self.denoising_block(block_index)
             sigma = sigmas[block_index].expand(batch_size)
             next_sigma = (
                 sigmas[block_index + 1].expand(batch_size)
@@ -677,7 +693,8 @@ class ToyDiffusionBlocks(nn.Module):
 
         predictions = []
         residual_losses = []
-        for block_index, block in enumerate(self.blocks):
+        for block_index in range(self.config.num_blocks):
+            block = self.denoising_block(block_index)
             sigma = sigmas[block_index].expand(x.shape[0])
             next_sigma = (
                 sigmas[block_index + 1].expand(x.shape[0])
@@ -788,6 +805,7 @@ def evaluate_model(
             {
                 "split": split,
                 "block_index": block_index,
+                "network_block_index": model.network_block_index(block_index),
                 "sigma": float(sigmas[block_index].detach().cpu()),
                 "sequential_mse": float(
                     (sequential_sse[block_index] / count).detach().cpu()
@@ -1110,6 +1128,7 @@ def write_eval_cycle_train_loss_csv(history: list[dict], path: str) -> None:
             fieldnames=[
                 "epoch",
                 "block_index",
+                "network_block_index",
                 "block_objective",
                 "sigma",
                 "train_loss",
@@ -2602,6 +2621,7 @@ def train(config: ToyConfig):
                     {
                         "epoch": epoch,
                         "block_index": block_index,
+                        "network_block_index": model.network_block_index(block_index),
                         "block_objective": model.block_objective(block_index),
                         "sigma": float(sigmas[block_index].detach().cpu()),
                         "train_loss": float(per_block_loss[block_index]),
@@ -2967,6 +2987,22 @@ def parse_args() -> ToyConfig:
         ),
     )
     parser.add_argument(
+        "--shared_denoising_block",
+        action="store_true",
+        help=(
+            "route every denoising/noise step through the same block network "
+            "instead of using one network per sigma level"
+        ),
+    )
+    parser.add_argument(
+        "--shared_denoising_block_index",
+        type=int,
+        default=ToyConfig.shared_denoising_block_index,
+        help=(
+            "which block network to reuse when --shared_denoising_block is set"
+        ),
+    )
+    parser.add_argument(
         "--initial_noise_mode",
         type=str,
         default=ToyConfig.initial_noise_mode,
@@ -3036,6 +3072,12 @@ def parse_args() -> ToyConfig:
     config = ToyConfig(**vars(args))
     if config.num_blocks < 1:
         raise ValueError("--num_blocks must be at least 1")
+    if config.shared_denoising_block_index < 0:
+        raise ValueError("--shared_denoising_block_index must be non-negative")
+    if config.shared_denoising_block_index >= config.num_blocks:
+        raise ValueError(
+            "--shared_denoising_block_index must be smaller than --num_blocks"
+        )
     if config.sigma_min <= 0 or config.sigma_max <= 0:
         raise ValueError("--sigma_min and --sigma_max must be positive")
     if config.sigma_min >= config.sigma_max:
