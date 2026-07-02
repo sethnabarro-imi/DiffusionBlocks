@@ -11,6 +11,61 @@ from vit import load_vit
 from dblock_modules import get_block_sigmas, get_discrete_sigmas
 
 
+def parse_shared_denoising_block_ranges(
+    ranges: str | None,
+    num_blocks: int,
+) -> list[tuple[int, int, int]]:
+    if ranges is None or ranges == "":
+        return []
+
+    parsed_ranges = []
+    covered_blocks = set()
+    for raw_range in ranges.split(","):
+        raw_range = raw_range.strip()
+        if raw_range == "":
+            continue
+        parts = raw_range.split(":")
+        if len(parts) not in [2, 3]:
+            raise ValueError(
+                "--shared_denoising_block_ranges entries must be "
+                "start:end or start:end:network_index"
+            )
+        try:
+            start = int(parts[0])
+            end = int(parts[1])
+            network_index = int(parts[2]) if len(parts) == 3 else start
+        except ValueError as exc:
+            raise ValueError(
+                "--shared_denoising_block_ranges entries must contain integer indices"
+            ) from exc
+        if start < 0 or end < 0 or network_index < 0:
+            raise ValueError(
+                "--shared_denoising_block_ranges indices must be non-negative"
+            )
+        if start >= end:
+            raise ValueError(
+                "--shared_denoising_block_ranges entries must have start < end"
+            )
+        if end > num_blocks:
+            raise ValueError(
+                "--shared_denoising_block_ranges range ends must be <= --num_blocks"
+            )
+        if network_index >= num_blocks:
+            raise ValueError(
+                "--shared_denoising_block_ranges network indices must be "
+                "smaller than --num_blocks"
+            )
+        blocks = set(range(start, end))
+        overlap = covered_blocks.intersection(blocks)
+        if overlap:
+            raise ValueError(
+                "--shared_denoising_block_ranges entries must not overlap"
+            )
+        covered_blocks.update(blocks)
+        parsed_ranges.append((start, end, network_index))
+    return parsed_ranges
+
+
 class ExpectedCalibrationError(torchmetrics.Metric):
     higher_is_better = False
     full_state_update = False
@@ -832,12 +887,26 @@ class ViTDBlockModel(ViTModel):
         self.shared_denoising_block_index = getattr(
             self.args, "shared_denoising_block_index", 0
         )
+        self.shared_denoising_block_ranges = getattr(
+            self.args, "shared_denoising_block_ranges", ""
+        )
+        if self.shared_denoising_block and self.shared_denoising_block_ranges:
+            raise ValueError(
+                "--shared_denoising_block and --shared_denoising_block_ranges are "
+                "mutually exclusive"
+            )
         if self.shared_denoising_block_index < 0:
             raise ValueError("--shared_denoising_block_index must be non-negative")
         if self.shared_denoising_block_index >= self.args.num_blocks:
             raise ValueError(
                 "--shared_denoising_block_index must be smaller than --num_blocks"
             )
+        self.parsed_shared_denoising_block_ranges = (
+            parse_shared_denoising_block_ranges(
+                self.shared_denoising_block_ranges,
+                self.args.num_blocks,
+            )
+        )
         self.dblock_training_objective = getattr(
             self.args, "dblock_training_objective", "classification"
         )
@@ -978,6 +1047,7 @@ class ViTDBlockModel(ViTModel):
                 ),
                 "shared_denoising_block": self.shared_denoising_block,
                 "shared_denoising_block_index": self.shared_denoising_block_index,
+                "shared_denoising_block_ranges": self.shared_denoising_block_ranges,
                 "cfg_scale": self.cfg_scale,
                 "class_dropout_prob": self.class_dropout_prob,
                 "trace_intermediate_predictions": self.trace_intermediate_predictions,
@@ -1177,17 +1247,18 @@ class ViTDBlockModel(ViTModel):
     def route_denoising_block_index(self, block_idx: int) -> int:
         if self.shared_denoising_block:
             return self.shared_denoising_block_index
+        for start, end, network_index in self.parsed_shared_denoising_block_ranges:
+            if start <= block_idx < end:
+                return network_index
         return block_idx
 
     def estimate_target_layer(self, sigma: torch.Tensor) -> int:
-        if self.shared_denoising_block:
-            return self.shared_denoising_block_index
         block_sigmas = torch.tensor(self.block_sigmas, device=sigma.device)
         block_idx = torch.bucketize(sigma, block_sigmas, right=True) - 1
         block_idx = (self.args.num_blocks - 1) - block_idx
         block_idx = torch.clamp(block_idx, 0, self.args.num_blocks - 1).long()
         values, counts = block_idx.unique(return_counts=True)
-        return values[counts.argmax()].item()
+        return self.route_denoising_block_index(values[counts.argmax()].item())
 
     def apply_classifier_free_guidance(self, logits: torch.Tensor) -> torch.Tensor:
         if not self.training and self.cfg_scale > 0.0:

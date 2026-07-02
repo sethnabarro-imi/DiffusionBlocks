@@ -19,7 +19,129 @@ def target_function(x: torch.Tensor, name: str) -> torch.Tensor:
         return 0.8 * torch.sin(5.0 * x) + 0.35 * torch.sign(torch.sin(1.5 * x))
     if name == "cubic":
         return 0.15 * x.pow(3) - 0.5 * x + torch.sin(2.0 * x)
+    if name == "sin_cos_bifurcation":
+        return 0.5 * (torch.sin(x) + torch.cos(x))
     raise ValueError(f"Unknown target function: {name}")
+
+
+def target_curves(x: torch.Tensor, name: str) -> list[tuple[str, torch.Tensor]]:
+    if name == "sin_cos_bifurcation":
+        return [
+            ("sin(x)", torch.sin(x)),
+            ("cos(x)", torch.cos(x)),
+        ]
+    return [("target", target_function(x, name))]
+
+
+def target_curve_point_sets(
+    x_values: list[float],
+    name: str,
+) -> list[dict]:
+    sorted_x = sorted(set(x_values))
+    x = torch.tensor(sorted_x, dtype=torch.float32).view(-1, 1)
+    curves = []
+    for index, (label, y) in enumerate(target_curves(x, name)):
+        curves.append(
+            {
+                "label": label,
+                "color": target_curve_color(index),
+                "hex_color": target_curve_hex_color(index),
+                "points": [
+                    (float(x_value), float(y_value))
+                    for x_value, y_value in zip(sorted_x, y[:, 0].tolist())
+                ],
+            }
+        )
+    return curves
+
+
+def target_curve_color(index: int) -> tuple[int, int, int]:
+    colors = [
+        (0, 0, 0),
+        (107, 114, 128),
+        (124, 58, 237),
+    ]
+    return colors[index % len(colors)]
+
+
+def target_curve_hex_color(index: int) -> str:
+    red, green, blue = target_curve_color(index)
+    return f"#{red:02x}{green:02x}{blue:02x}"
+
+
+def sample_target_values(
+    x: torch.Tensor,
+    config: "ToyConfig",
+    generator: torch.Generator,
+) -> torch.Tensor:
+    if config.function != "sin_cos_bifurcation":
+        return target_function(x, config.function)
+
+    branch = torch.randint(
+        0,
+        2,
+        (x.shape[0], 1),
+        generator=generator,
+        device=x.device,
+    )
+    sin_y = torch.sin(x)
+    cos_y = torch.cos(x)
+    return torch.where(branch == 0, sin_y, cos_y)
+
+
+def parse_shared_denoising_block_ranges(
+    ranges: str | None,
+    num_blocks: int,
+) -> list[tuple[int, int, int]]:
+    if ranges is None or ranges == "":
+        return []
+
+    parsed_ranges = []
+    covered_blocks = set()
+    for raw_range in ranges.split(","):
+        raw_range = raw_range.strip()
+        if raw_range == "":
+            continue
+        parts = raw_range.split(":")
+        if len(parts) not in [2, 3]:
+            raise ValueError(
+                "--shared_denoising_block_ranges entries must be "
+                "start:end or start:end:network_index"
+            )
+        try:
+            start = int(parts[0])
+            end = int(parts[1])
+            network_index = int(parts[2]) if len(parts) == 3 else start
+        except ValueError as exc:
+            raise ValueError(
+                "--shared_denoising_block_ranges entries must contain integer indices"
+            ) from exc
+        if start < 0 or end < 0 or network_index < 0:
+            raise ValueError(
+                "--shared_denoising_block_ranges indices must be non-negative"
+            )
+        if start >= end:
+            raise ValueError(
+                "--shared_denoising_block_ranges entries must have start < end"
+            )
+        if end > num_blocks:
+            raise ValueError(
+                "--shared_denoising_block_ranges range ends must be <= --num_blocks"
+            )
+        if network_index >= num_blocks:
+            raise ValueError(
+                "--shared_denoising_block_ranges network indices must be "
+                "smaller than --num_blocks"
+            )
+        blocks = set(range(start, end))
+        overlap = covered_blocks.intersection(blocks)
+        if overlap:
+            raise ValueError(
+                "--shared_denoising_block_ranges entries must not overlap"
+            )
+        covered_blocks.update(blocks)
+        parsed_ranges.append((start, end, network_index))
+    return parsed_ranges
 
 
 @dataclass
@@ -45,6 +167,7 @@ class ToyConfig:
     residual_next_latent_training_mode: str = "sequential"
     shared_denoising_block: bool = False
     shared_denoising_block_index: int = 0
+    shared_denoising_block_ranges: str = ""
     initial_noise_mode: str = "per_example"
     initial_noise_std: float | None = None
     train_encoder_with_prediction_loss_only: bool = False
@@ -62,7 +185,7 @@ class ToyConfig:
 def make_dataset(num_examples: int, config: ToyConfig, seed_offset: int):
     generator = torch.Generator().manual_seed(config.seed + seed_offset)
     x = -3.0 + 6.0 * torch.rand(num_examples, 1, generator=generator)
-    y = target_function(x, config.function)
+    y = sample_target_values(x, config, generator)
     if config.observation_noise_std > 0.0:
         y = y + config.observation_noise_std * torch.randn(
             y.shape,
@@ -129,6 +252,10 @@ class ToyDiffusionBlocks(nn.Module):
                 DenoisingBlock(self.state_dim, config.hidden_dim, config.depth)
                 for _ in range(config.num_blocks)
             ]
+        )
+        self.shared_denoising_block_ranges = parse_shared_denoising_block_ranges(
+            config.shared_denoising_block_ranges,
+            config.num_blocks,
         )
         fixed_noise_generator = torch.Generator(device="cpu").manual_seed(
             config.seed + 75_000
@@ -233,6 +360,9 @@ class ToyDiffusionBlocks(nn.Module):
     def network_block_index(self, block_index: int) -> int:
         if self.config.shared_denoising_block:
             return self.config.shared_denoising_block_index
+        for start, end, network_index in self.shared_denoising_block_ranges:
+            if start <= block_index < end:
+                return network_index
         return block_index
 
     def denoising_block(self, block_index: int) -> DenoisingBlock:
@@ -974,6 +1104,55 @@ def evaluate_prediction_uncertainty(
     return rows
 
 
+def evaluate_prediction_uncertainty_samples(
+    model: ToyDiffusionBlocks,
+    config: ToyConfig,
+    sigmas: torch.Tensor,
+) -> list[dict]:
+    if config.prediction_uncertainty_samples <= 0:
+        return []
+
+    model.eval()
+    x = torch.linspace(
+        -3.2,
+        3.2,
+        config.prediction_grid_points,
+        device=sigmas.device,
+    ).view(-1, 1)
+    generator = torch.Generator(device="cpu").manual_seed(config.seed + 90_000)
+    rows = []
+    cpu_x = x[:, 0].detach().cpu().tolist()
+    with torch.no_grad():
+        for sample_index in range(config.prediction_uncertainty_samples):
+            noise = torch.randn(
+                config.prediction_grid_points,
+                model.state_dim,
+                generator=generator,
+                device="cpu",
+            ).to(sigmas.device)
+            predictions, _ = model.sequential_predictions(
+                x,
+                sigmas,
+                noise=noise,
+                prediction_mode="clean_estimate",
+            )
+            cpu_predictions = predictions[:, :, 0].detach().cpu().tolist()
+            for block_index, block_predictions in enumerate(cpu_predictions):
+                for point_index, (x_value, prediction_value) in enumerate(
+                    zip(cpu_x, block_predictions)
+                ):
+                    rows.append(
+                        {
+                            "sample_index": sample_index,
+                            "block_index": block_index,
+                            "point_index": point_index,
+                            "x": x_value,
+                            "sequential_prediction": prediction_value,
+                        }
+                    )
+    return rows
+
+
 def write_rows_csv(rows: list[dict], path: str) -> None:
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
@@ -1190,6 +1369,8 @@ def write_prediction_uncertainty_csv(rows: list[dict], path: str) -> None:
 
 def write_prediction_uncertainty_plot(
     rows: list[dict],
+    config: ToyConfig,
+    sample_rows: list[dict],
     train_data: TensorDataset,
     test_data: TensorDataset,
     png_path: str,
@@ -1208,6 +1389,22 @@ def write_prediction_uncertainty_plot(
         by_block[int(row["block_index"])].append(row)
     for block_rows in by_block.values():
         block_rows.sort(key=lambda row: int(row["point_index"]))
+    sample_by_block = {block: {} for block in blocks}
+    for row in sample_rows:
+        block = int(row["block_index"])
+        if block not in sample_by_block:
+            continue
+        sample_index = int(row["sample_index"])
+        sample_by_block[block].setdefault(sample_index, []).append(
+            (float(row["x"]), float(row["sequential_prediction"]))
+        )
+    for block_samples in sample_by_block.values():
+        for points in block_samples.values():
+            points.sort(key=lambda point: point[0])
+    show_sample_predictions = (
+        config.function == "sin_cos_bifurcation"
+        and any(sample_by_block[block] for block in blocks)
+    )
 
     train_x, train_y = train_data.tensors
     test_x, test_y = test_data.tensors
@@ -1223,12 +1420,26 @@ def write_prediction_uncertainty_plot(
     x_values = [float(row["x"]) for row in rows] + [
         x for x, _ in train_points + test_points
     ]
+    target_curve_sets = target_curve_point_sets(
+        [float(row["x"]) for row in rows],
+        config.function,
+    )
     y_values = (
-        [float(row["target_y"]) for row in rows]
-        + [float(row["prediction_lower_2sigma"]) for row in rows]
-        + [float(row["prediction_upper_2sigma"]) for row in rows]
+        [y for curve in target_curve_sets for _, y in curve["points"]]
         + [y for _, y in train_points + test_points]
     )
+    if show_sample_predictions:
+        y_values += [
+            y
+            for block_samples in sample_by_block.values()
+            for points in block_samples.values()
+            for _, y in points
+        ]
+    else:
+        y_values += (
+            [float(row["prediction_lower_2sigma"]) for row in rows]
+            + [float(row["prediction_upper_2sigma"]) for row in rows]
+        )
     x_min, x_max = min(x_values), max(x_values)
     y_min, y_max = min(y_values), max(y_values)
     y_pad = 0.08 * max(y_max - y_min, 1e-6)
@@ -1365,29 +1576,47 @@ def write_prediction_uncertainty_plot(
                 anchor="ra",
             )
 
-        overlay_draw.polygon(
-            band_polygon(
-                block,
-                "prediction_lower_2sigma",
-                "prediction_upper_2sigma",
-                panel_left,
-                panel_top,
-            ),
-            fill=(191, 219, 254, 115),
-        )
-        overlay_draw.polygon(
-            band_polygon(
-                block,
-                "prediction_lower_1sigma",
-                "prediction_upper_1sigma",
-                panel_left,
-                panel_top,
-            ),
-            fill=(96, 165, 250, 135),
-        )
-        target_points = line_points(block, "target_y", panel_left, panel_top)
+        if show_sample_predictions:
+            for sample_points in sample_by_block[block].values():
+                prediction_points = [
+                    (sx(x, panel_left), sy(y, panel_top))
+                    for x, y in sample_points
+                ]
+                if len(prediction_points) > 1:
+                    overlay_draw.line(
+                        prediction_points,
+                        fill=(37, 99, 235, 42),
+                        width=1,
+                        joint="curve",
+                    )
+        else:
+            overlay_draw.polygon(
+                band_polygon(
+                    block,
+                    "prediction_lower_2sigma",
+                    "prediction_upper_2sigma",
+                    panel_left,
+                    panel_top,
+                ),
+                fill=(191, 219, 254, 115),
+            )
+            overlay_draw.polygon(
+                band_polygon(
+                    block,
+                    "prediction_lower_1sigma",
+                    "prediction_upper_1sigma",
+                    panel_left,
+                    panel_top,
+                ),
+                fill=(96, 165, 250, 135),
+            )
         mean_points = line_points(block, "prediction_mean", panel_left, panel_top)
-        draw.line(target_points, fill=(0, 0, 0), width=3, joint="curve")
+        for curve in target_curve_sets:
+            target_points = [
+                (sx(x, panel_left), sy(y, panel_top))
+                for x, y in curve["points"]
+            ]
+            draw.line(target_points, fill=curve["color"], width=3, joint="curve")
         draw.line(mean_points, fill=(37, 99, 235), width=2, joint="curve")
         for x, y in train_points:
             px = sx(x, panel_left)
@@ -1415,9 +1644,13 @@ def write_prediction_uncertainty_plot(
         col_index = panel_index % columns
         panel_left = left + col_index * (panel_w + gap_x)
         panel_top = top + row_index * (panel_h + gap_y)
-        target_points = line_points(block, "target_y", panel_left, panel_top)
         mean_points = line_points(block, "prediction_mean", panel_left, panel_top)
-        draw.line(target_points, fill=(0, 0, 0), width=3, joint="curve")
+        for curve in target_curve_sets:
+            target_points = [
+                (sx(x, panel_left), sy(y, panel_top))
+                for x, y in curve["points"]
+            ]
+            draw.line(target_points, fill=curve["color"], width=3, joint="curve")
         draw.line(mean_points, fill=(37, 99, 235), width=2, joint="curve")
         for x, y in train_points:
             px = sx(x, panel_left)
@@ -1440,18 +1673,46 @@ def write_prediction_uncertainty_plot(
 
     key_x = width - right + 34
     key_y = top + 4
-    draw.rectangle((key_x, key_y, key_x + 24, key_y + 12), fill=(191, 219, 254))
-    draw.text((key_x + 32, key_y - 2), "2 sigma", font=font, fill=(17, 24, 39))
-    draw.rectangle((key_x, key_y + 24, key_x + 24, key_y + 36), fill=(96, 165, 250))
-    draw.text((key_x + 32, key_y + 22), "1 sigma", font=font, fill=(17, 24, 39))
-    draw.line((key_x, key_y + 56, key_x + 24, key_y + 56), fill=(37, 99, 235), width=2)
-    draw.text((key_x + 32, key_y + 49), "mean", font=font, fill=(17, 24, 39))
-    draw.line((key_x, key_y + 80, key_x + 24, key_y + 80), fill=(0, 0, 0), width=3)
-    draw.text((key_x + 32, key_y + 73), "target", font=font, fill=(17, 24, 39))
-    draw.ellipse((key_x, key_y + 100, key_x + 8, key_y + 108), fill=(22, 163, 74))
-    draw.text((key_x + 16, key_y + 96), "train", font=font, fill=(17, 24, 39))
-    draw.ellipse((key_x, key_y + 122, key_x + 8, key_y + 130), fill=(250, 204, 21))
-    draw.text((key_x + 16, key_y + 118), "test", font=font, fill=(17, 24, 39))
+    if show_sample_predictions:
+        draw.line(
+            (key_x, key_y + 8, key_x + 24, key_y + 8),
+            fill=(37, 99, 235),
+            width=1,
+        )
+        draw.text((key_x + 32, key_y), "samples", font=font, fill=(17, 24, 39))
+        draw.line(
+            (key_x, key_y + 32, key_x + 24, key_y + 32),
+            fill=(37, 99, 235),
+            width=2,
+        )
+        draw.text((key_x + 32, key_y + 25), "mean", font=font, fill=(17, 24, 39))
+        legend_y = key_y + 56
+    else:
+        draw.rectangle((key_x, key_y, key_x + 24, key_y + 12), fill=(191, 219, 254))
+        draw.text((key_x + 32, key_y - 2), "2 sigma", font=font, fill=(17, 24, 39))
+        draw.rectangle((key_x, key_y + 24, key_x + 24, key_y + 36), fill=(96, 165, 250))
+        draw.text((key_x + 32, key_y + 22), "1 sigma", font=font, fill=(17, 24, 39))
+        draw.line((key_x, key_y + 56, key_x + 24, key_y + 56), fill=(37, 99, 235), width=2)
+        draw.text((key_x + 32, key_y + 49), "mean", font=font, fill=(17, 24, 39))
+        legend_y = key_y + 80
+    for curve in target_curve_sets:
+        draw.line(
+            (key_x, legend_y, key_x + 24, legend_y),
+            fill=curve["color"],
+            width=3,
+        )
+        draw.text(
+            (key_x + 32, legend_y - 7),
+            curve["label"],
+            font=font,
+            fill=(17, 24, 39),
+        )
+        legend_y += 24
+    draw.ellipse((key_x, legend_y - 4, key_x + 8, legend_y + 4), fill=(22, 163, 74))
+    draw.text((key_x + 16, legend_y - 8), "train", font=font, fill=(17, 24, 39))
+    legend_y += 22
+    draw.ellipse((key_x, legend_y - 4, key_x + 8, legend_y + 4), fill=(250, 204, 21))
+    draw.text((key_x + 16, legend_y - 8), "test", font=font, fill=(17, 24, 39))
     image.convert("RGB").save(png_path)
 
     def svg_points(points: list[tuple[float, float]]) -> str:
@@ -1494,15 +1755,31 @@ def write_prediction_uncertainty_plot(
         svg.append(
             f'<text class="label" x="{panel_left + 6}" y="{panel_top + 18}">block {block}</text>'
         )
-        svg.append(
-            f'<polygon points="{svg_band(block, "prediction_lower_2sigma", "prediction_upper_2sigma", panel_left, panel_top)}" fill="#bfdbfe" opacity="0.45"/>'
-        )
-        svg.append(
-            f'<polygon points="{svg_band(block, "prediction_lower_1sigma", "prediction_upper_1sigma", panel_left, panel_top)}" fill="#60a5fa" opacity="0.55"/>'
-        )
-        svg.append(
-            f'<polyline points="{svg_points(line_points(block, "target_y", panel_left, panel_top))}" fill="none" stroke="#000000" stroke-width="3"/>'
-        )
+        if show_sample_predictions:
+            for sample_points in sample_by_block[block].values():
+                prediction_points = [
+                    (sx(x, panel_left), sy(y, panel_top))
+                    for x, y in sample_points
+                ]
+                if len(prediction_points) > 1:
+                    svg.append(
+                        f'<polyline points="{svg_points(prediction_points)}" fill="none" stroke="#2563eb" stroke-width="1" opacity="0.18"/>'
+                    )
+        else:
+            svg.append(
+                f'<polygon points="{svg_band(block, "prediction_lower_2sigma", "prediction_upper_2sigma", panel_left, panel_top)}" fill="#bfdbfe" opacity="0.45"/>'
+            )
+            svg.append(
+                f'<polygon points="{svg_band(block, "prediction_lower_1sigma", "prediction_upper_1sigma", panel_left, panel_top)}" fill="#60a5fa" opacity="0.55"/>'
+            )
+        for curve in target_curve_sets:
+            target_points = [
+                (sx(x, panel_left), sy(y, panel_top))
+                for x, y in curve["points"]
+            ]
+            svg.append(
+                f'<polyline points="{svg_points(target_points)}" fill="none" stroke="{curve["hex_color"]}" stroke-width="3"/>'
+            )
         svg.append(
             f'<polyline points="{svg_points(line_points(block, "prediction_mean", panel_left, panel_top))}" fill="none" stroke="#2563eb" stroke-width="2"/>'
         )
@@ -1516,21 +1793,48 @@ def write_prediction_uncertainty_plot(
             )
     key_x = width - right + 34
     key_y = top + 4
-    svg.extend(
-        [
-            f'<rect x="{key_x}" y="{key_y}" width="24" height="12" fill="#bfdbfe" opacity="0.75"/>',
-            f'<text class="legend" x="{key_x + 32}" y="{key_y + 10}">2 sigma</text>',
-            f'<rect x="{key_x}" y="{key_y + 24}" width="24" height="12" fill="#60a5fa" opacity="0.85"/>',
-            f'<text class="legend" x="{key_x + 32}" y="{key_y + 34}">1 sigma</text>',
-            f'<line x1="{key_x}" y1="{key_y + 56}" x2="{key_x + 24}" y2="{key_y + 56}" stroke="#2563eb" stroke-width="2"/>',
-            f'<text class="legend" x="{key_x + 32}" y="{key_y + 60}">mean</text>',
-            f'<line x1="{key_x}" y1="{key_y + 80}" x2="{key_x + 24}" y2="{key_y + 80}" stroke="#000000" stroke-width="3"/>',
-            f'<text class="legend" x="{key_x + 32}" y="{key_y + 84}">target</text>',
-            f'<circle cx="{key_x + 4}" cy="{key_y + 104}" r="4" fill="#16a34a" stroke="#14532d" stroke-width="0.8"/>',
-            f'<text class="legend" x="{key_x + 16}" y="{key_y + 108}">train</text>',
-            f'<circle cx="{key_x + 4}" cy="{key_y + 126}" r="4" fill="#facc15" stroke="#713f12" stroke-width="0.8"/>',
-            f'<text class="legend" x="{key_x + 16}" y="{key_y + 130}">test</text>',
-        ]
+    if show_sample_predictions:
+        svg.extend(
+            [
+                f'<line x1="{key_x}" y1="{key_y + 8}" x2="{key_x + 24}" y2="{key_y + 8}" stroke="#2563eb" stroke-width="1" opacity="0.35"/>',
+                f'<text class="legend" x="{key_x + 32}" y="{key_y + 12}">samples</text>',
+                f'<line x1="{key_x}" y1="{key_y + 32}" x2="{key_x + 24}" y2="{key_y + 32}" stroke="#2563eb" stroke-width="2"/>',
+                f'<text class="legend" x="{key_x + 32}" y="{key_y + 36}">mean</text>',
+            ]
+        )
+        legend_y = key_y + 56
+    else:
+        svg.extend(
+            [
+                f'<rect x="{key_x}" y="{key_y}" width="24" height="12" fill="#bfdbfe" opacity="0.75"/>',
+                f'<text class="legend" x="{key_x + 32}" y="{key_y + 10}">2 sigma</text>',
+                f'<rect x="{key_x}" y="{key_y + 24}" width="24" height="12" fill="#60a5fa" opacity="0.85"/>',
+                f'<text class="legend" x="{key_x + 32}" y="{key_y + 34}">1 sigma</text>',
+                f'<line x1="{key_x}" y1="{key_y + 56}" x2="{key_x + 24}" y2="{key_y + 56}" stroke="#2563eb" stroke-width="2"/>',
+                f'<text class="legend" x="{key_x + 32}" y="{key_y + 60}">mean</text>',
+            ]
+        )
+        legend_y = key_y + 80
+    for curve in target_curve_sets:
+        svg.append(
+            f'<line x1="{key_x}" y1="{legend_y}" x2="{key_x + 24}" y2="{legend_y}" stroke="{curve["hex_color"]}" stroke-width="3"/>'
+        )
+        svg.append(
+            f'<text class="legend" x="{key_x + 32}" y="{legend_y + 4}">{curve["label"]}</text>'
+        )
+        legend_y += 24
+    svg.append(
+        f'<circle cx="{key_x + 4}" cy="{legend_y}" r="4" fill="#16a34a" stroke="#14532d" stroke-width="0.8"/>'
+    )
+    svg.append(
+        f'<text class="legend" x="{key_x + 16}" y="{legend_y + 4}">train</text>'
+    )
+    legend_y += 22
+    svg.append(
+        f'<circle cx="{key_x + 4}" cy="{legend_y}" r="4" fill="#facc15" stroke="#713f12" stroke-width="0.8"/>'
+    )
+    svg.append(
+        f'<text class="legend" x="{key_x + 16}" y="{legend_y + 4}">test</text>'
     )
     svg.append("</svg>")
     with open(svg_path, "w") as f:
@@ -2101,6 +2405,7 @@ def write_eval_cycle_train_loss_plot(
 
 def write_prediction_curve_eval_cycle_plot(
     history: list[dict],
+    config: ToyConfig,
     train_data: TensorDataset,
     test_data: TensorDataset,
     png_path: str,
@@ -2126,7 +2431,6 @@ def write_prediction_curve_eval_cycle_plot(
         for block in blocks
         for epoch in epochs
     }
-    target_by_block = {block: [] for block in blocks}
     for row in rows:
         key = (int(row["block_index"]), int(row["epoch"]))
         by_block_epoch[key].append(
@@ -2135,10 +2439,6 @@ def write_prediction_curve_eval_cycle_plot(
                 float(row["sequential_prediction"]),
             )
         )
-        if int(row["epoch"]) == epochs[0]:
-            target_by_block[int(row["block_index"])].append(
-                (float(row["x"]), float(row["target_y"]))
-            )
 
     train_x, train_y = train_data.tensors
     test_x, test_y = test_data.tensors
@@ -2154,7 +2454,11 @@ def write_prediction_curve_eval_cycle_plot(
     x_values = [float(row["x"]) for row in rows] + [
         x for x, _ in train_points + test_points
     ]
-    y_values = [float(row["target_y"]) for row in rows] + [
+    target_curve_sets = target_curve_point_sets(
+        [float(row["x"]) for row in rows],
+        config.function,
+    )
+    y_values = [y for curve in target_curve_sets for _, y in curve["points"]] + [
         float(row["sequential_prediction"]) for row in rows
     ] + [
         y for _, y in train_points + test_points
@@ -2256,12 +2560,13 @@ def write_prediction_curve_eval_cycle_plot(
                     anchor="ra",
                 )
 
-        target_points = [
-            (sx(x, px), sy(y, py))
-            for x, y in sorted(target_by_block[block], key=lambda pair: pair[0])
-        ]
-        if len(target_points) > 1:
-            draw.line(target_points, fill=(0, 0, 0), width=3)
+        for curve in target_curve_sets:
+            target_points = [
+                (sx(x, px), sy(y, py))
+                for x, y in curve["points"]
+            ]
+            if len(target_points) > 1:
+                draw.line(target_points, fill=curve["color"], width=3)
 
         for epoch in epochs:
             color = epoch_color(epoch_index(epoch), len(epochs))
@@ -2294,7 +2599,7 @@ def write_prediction_curve_eval_cycle_plot(
     colorbar_x = width - right + 44
     colorbar_y = top + 30
     colorbar_w = 24
-    colorbar_h = min(420, height - top - bottom - 40)
+    colorbar_h = min(420, max(90, height - colorbar_y - 160))
     draw.text(
         (colorbar_x - 6, colorbar_y - 30),
         "Epoch",
@@ -2353,17 +2658,20 @@ def write_prediction_curve_eval_cycle_plot(
         font=font,
         fill=(17, 24, 39),
     )
-    draw.line(
-        (colorbar_x, key_y + 44, colorbar_x + 20, key_y + 44),
-        fill=(0, 0, 0),
-        width=3,
-    )
-    draw.text(
-        (colorbar_x + 26, key_y + 37),
-        "target",
-        font=font,
-        fill=(17, 24, 39),
-    )
+    target_key_y = key_y + 44
+    for curve in target_curve_sets:
+        draw.line(
+            (colorbar_x, target_key_y, colorbar_x + 20, target_key_y),
+            fill=curve["color"],
+            width=3,
+        )
+        draw.text(
+            (colorbar_x + 26, target_key_y - 7),
+            curve["label"],
+            font=font,
+            fill=(17, 24, 39),
+        )
+        target_key_y += 22
     image.save(png_path)
 
     def svg_color(idx: int) -> str:
@@ -2404,13 +2712,14 @@ def write_prediction_curve_eval_cycle_plot(
                 svg.append(
                     f'<text class="tick" x="{px - 8}" y="{yy + 4:.2f}" text-anchor="end">{value:.1f}</text>'
                 )
-        target_points = " ".join(
-            f"{sx(x, px):.2f},{sy(y, py):.2f}"
-            for x, y in sorted(target_by_block[block], key=lambda pair: pair[0])
-        )
-        svg.append(
-            f'<polyline points="{target_points}" fill="none" stroke="#000000" stroke-width="2.6"/>'
-        )
+        for curve in target_curve_sets:
+            target_points = " ".join(
+                f"{sx(x, px):.2f},{sy(y, py):.2f}"
+                for x, y in curve["points"]
+            )
+            svg.append(
+                f'<polyline points="{target_points}" fill="none" stroke="{curve["hex_color"]}" stroke-width="2.6"/>'
+            )
         for epoch in epochs:
             prediction_points = " ".join(
                 f"{sx(x, px):.2f},{sy(y, py):.2f}"
@@ -2469,12 +2778,15 @@ def write_prediction_curve_eval_cycle_plot(
     svg.append(
         f'<text class="epoch" x="{colorbar_x + 14}" y="{key_y + 26}">test</text>'
     )
-    svg.append(
-        f'<line x1="{colorbar_x}" y1="{key_y + 44}" x2="{colorbar_x + 20}" y2="{key_y + 44}" stroke="#000000" stroke-width="3"/>'
-    )
-    svg.append(
-        f'<text class="epoch" x="{colorbar_x + 26}" y="{key_y + 48}">target</text>'
-    )
+    target_key_y = key_y + 44
+    for curve in target_curve_sets:
+        svg.append(
+            f'<line x1="{colorbar_x}" y1="{target_key_y}" x2="{colorbar_x + 20}" y2="{target_key_y}" stroke="{curve["hex_color"]}" stroke-width="3"/>'
+        )
+        svg.append(
+            f'<text class="epoch" x="{colorbar_x + 26}" y="{target_key_y + 4}">{curve["label"]}</text>'
+        )
+        target_key_y += 22
     svg.append("</svg>")
     with open(svg_path, "w") as f:
         f.write("\n".join(svg))
@@ -2498,13 +2810,19 @@ def write_prediction_plot(
     model.eval()
     x = torch.linspace(-3.2, 3.2, 512, device=sigmas.device).view(-1, 1)
     with torch.no_grad():
-        y_true = target_function(x, config.function)
         seq_preds, _ = model.sequential_predictions(x, sigmas)
 
     fig, ax = plt.subplots(figsize=(7, 4.5))
     train_x, train_y = train_data.tensors
     test_x, test_y = test_data.tensors
-    ax.plot(x.cpu(), y_true.cpu(), color="black", linewidth=2, label="target")
+    for index, (label, y_true) in enumerate(target_curves(x, config.function)):
+        ax.plot(
+            x.cpu(),
+            y_true.cpu(),
+            color=target_curve_hex_color(index),
+            linewidth=2,
+            label=label,
+        )
     for idx in range(config.num_blocks):
         alpha = 0.25 + 0.65 * (idx + 1) / config.num_blocks
         ax.plot(
@@ -2670,6 +2988,11 @@ def train(config: ToyConfig):
         config,
         sigmas,
     )
+    prediction_uncertainty_sample_rows = evaluate_prediction_uncertainty_samples(
+        model,
+        config,
+        sigmas,
+    )
     final_rows = history[-1]["train_block_rows"] + history[-1]["test_block_rows"]
     config_path = os.path.join(run_dir, "config.json")
     metrics_path = os.path.join(run_dir, "metrics.json")
@@ -2816,6 +3139,7 @@ def train(config: ToyConfig):
         )
         wrote_prediction_curve_plot = write_prediction_curve_eval_cycle_plot(
             history,
+            config,
             train_data,
             test_data,
             prediction_curve_png_path,
@@ -2823,6 +3147,8 @@ def train(config: ToyConfig):
         )
         wrote_prediction_uncertainty_plot = write_prediction_uncertainty_plot(
             prediction_uncertainty_rows,
+            config,
+            prediction_uncertainty_sample_rows,
             train_data,
             test_data,
             prediction_uncertainty_png_path,
@@ -3003,6 +3329,17 @@ def parse_args() -> ToyConfig:
         ),
     )
     parser.add_argument(
+        "--shared_denoising_block_ranges",
+        type=str,
+        default=ToyConfig.shared_denoising_block_ranges,
+        help=(
+            "comma-separated half-open block sharing ranges. Each entry is "
+            "start:end or start:end:network_index; start:end reuses the "
+            "network at start for denoising block indices start through end-1, "
+            "for example 0:4,4:8,8:12"
+        ),
+    )
+    parser.add_argument(
         "--initial_noise_mode",
         type=str,
         default=ToyConfig.initial_noise_mode,
@@ -3047,7 +3384,7 @@ def parse_args() -> ToyConfig:
         "--function",
         type=str,
         default=ToyConfig.function,
-        choices=["sine_poly", "saw_sine", "cubic"],
+        choices=["sine_poly", "saw_sine", "cubic", "sin_cos_bifurcation"],
     )
     parser.add_argument("--seed", type=int, default=ToyConfig.seed)
     parser.add_argument("--output_dir", type=str, default=ToyConfig.output_dir)
@@ -3072,12 +3409,21 @@ def parse_args() -> ToyConfig:
     config = ToyConfig(**vars(args))
     if config.num_blocks < 1:
         raise ValueError("--num_blocks must be at least 1")
+    if config.shared_denoising_block and config.shared_denoising_block_ranges:
+        raise ValueError(
+            "--shared_denoising_block and --shared_denoising_block_ranges are "
+            "mutually exclusive"
+        )
     if config.shared_denoising_block_index < 0:
         raise ValueError("--shared_denoising_block_index must be non-negative")
     if config.shared_denoising_block_index >= config.num_blocks:
         raise ValueError(
             "--shared_denoising_block_index must be smaller than --num_blocks"
         )
+    parse_shared_denoising_block_ranges(
+        config.shared_denoising_block_ranges,
+        config.num_blocks,
+    )
     if config.sigma_min <= 0 or config.sigma_max <= 0:
         raise ValueError("--sigma_min and --sigma_max must be positive")
     if config.sigma_min >= config.sigma_max:

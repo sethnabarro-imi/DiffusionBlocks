@@ -14,7 +14,7 @@ from lightning.pytorch.callbacks import Callback, ModelCheckpoint, LearningRateM
 from lightning.pytorch.strategies import DDPStrategy, DeepSpeedStrategy
 
 from data import load_data
-from model import load_model
+from model import load_model, parse_shared_denoising_block_ranges
 
 torch.set_float32_matmul_precision("high")
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -223,6 +223,9 @@ def write_eval_results(args, data, logdir, ckpt_path, split_results):
         "shared_denoising_block": getattr(args, "shared_denoising_block", False),
         "shared_denoising_block_index": getattr(
             args, "shared_denoising_block_index", 0
+        ),
+        "shared_denoising_block_ranges": getattr(
+            args, "shared_denoising_block_ranges", ""
         ),
         "trace_block_layers": getattr(args, "trace_block_layers", False),
         "trace_intermediate_predictions": (
@@ -525,6 +528,15 @@ def validate_args(args):
         )
     if args.shared_denoising_block and args.model_type != "dblock":
         raise ValueError("--shared_denoising_block is only supported for dblock")
+    if args.shared_denoising_block_ranges and args.model_type != "dblock":
+        raise ValueError(
+            "--shared_denoising_block_ranges is only supported for dblock"
+        )
+    if args.shared_denoising_block and args.shared_denoising_block_ranges:
+        raise ValueError(
+            "--shared_denoising_block and --shared_denoising_block_ranges are "
+            "mutually exclusive"
+        )
     if args.num_blocks < 1:
         raise ValueError("--num_blocks must be at least 1")
     if args.shared_denoising_block_index < 0:
@@ -533,6 +545,10 @@ def validate_args(args):
         raise ValueError(
             "--shared_denoising_block_index must be smaller than --num_blocks"
         )
+    parse_shared_denoising_block_ranges(
+        args.shared_denoising_block_ranges,
+        args.num_blocks,
+    )
     if args.dblock_training_objective != "classification":
         if args.model_type != "dblock":
             raise ValueError("--dblock_training_objective is only supported for dblock")
@@ -851,6 +867,17 @@ if __name__ == "__main__":
         default=0,
         help=(
             "which block network to reuse when --shared_denoising_block is set"
+        ),
+    )
+    parser.add_argument(
+        "--shared_denoising_block_ranges",
+        type=str,
+        default="",
+        help=(
+            "comma-separated half-open block sharing ranges. Each entry is "
+            "start:end or start:end:network_index; start:end reuses the "
+            "network at start for denoising block indices start through end-1, "
+            "for example 0:4,4:8,8:12"
         ),
     )
     parser.add_argument(

@@ -227,6 +227,9 @@ results/toy_1d_regression/<timestamp>/prediction_uncertainty_by_block.svg
 
 Use `--observation_noise_std` to add Gaussian observation noise to both train
 and test targets. The old `--target_noise_std` name is kept as an alias.
+Use `--function sin_cos_bifurcation` for a bifurcated regression dataset where
+each example is independently sampled from either `sin(x)` or `cos(x)` with
+equal probability. Prediction plots draw both ground-truth branches.
 Use `--initial_noise_std 1.0` to make the initial sequential denoising state
 standard normal; when omitted, it uses the previous default
 `sqrt(1 + sigma[0]^2)` scaling.
@@ -237,7 +240,8 @@ even-indexed blocks with prediction loss and odd-indexed blocks with residual
 loss.
 Use `--prediction_uncertainty_samples` to control how many random initial-noise
 draws are used for the final per-block Gaussian prediction interval plot; the
-default is 50, and 0 skips it.
+default is 50, and 0 skips it. For bifurcated datasets, this plot shows the
+individual sampled prediction curves with low alpha instead of Gaussian bands.
 
 ## Evaluation
 
