@@ -214,6 +214,9 @@ def write_eval_results(args, data, logdir, ckpt_path, split_results):
         "one_hot_mse_top_k": getattr(args, "one_hot_mse_top_k", None),
         "num_prediction_samples": args.num_prediction_samples,
         "prediction_average": args.prediction_average,
+        "dblock_interblock_transition": getattr(
+            args, "dblock_interblock_transition", "euler"
+        ),
         "sequential_denoising_training": getattr(
             args, "sequential_denoising_training", False
         ),
@@ -374,6 +377,9 @@ def write_blockwise_training_eval_results(
         "one_hot_mse_top_k": getattr(args, "one_hot_mse_top_k", None),
         "num_prediction_samples": args.num_prediction_samples,
         "prediction_average": args.prediction_average,
+        "dblock_interblock_transition": getattr(
+            args, "dblock_interblock_transition", "euler"
+        ),
         "sequential_denoising_training": getattr(
             args, "sequential_denoising_training", False
         ),
@@ -522,6 +528,8 @@ def validate_args(args):
         raise ValueError("--trace_oracle_noise_predictions is only supported for dblock")
     if args.sequential_denoising_training and args.model_type != "dblock":
         raise ValueError("--sequential_denoising_training is only supported for dblock")
+    if args.dblock_interblock_transition != "euler" and args.model_type != "dblock":
+        raise ValueError("--dblock_interblock_transition is only supported for dblock")
     if args.hybrid_block0_independent_training and args.model_type != "dblock":
         raise ValueError(
             "--hybrid_block0_independent_training is only supported for dblock"
@@ -578,6 +586,14 @@ def validate_args(args):
                     f"--dblock_training_objective {args.dblock_training_objective} is not "
                     "currently supported with --hybrid_block0_independent_training"
                 )
+    if (
+        args.dblock_interblock_transition != "euler"
+        and args.dblock_training_objective != "classification"
+    ):
+        raise ValueError(
+            "--dblock_interblock_transition direct modes are currently supported "
+            "only with --dblock_training_objective classification"
+        )
     if args.data_name == "synthetic-teacher":
         if args.synthetic_num_train < 1:
             raise ValueError("--synthetic_num_train must be at least 1")
@@ -830,6 +846,27 @@ if __name__ == "__main__":
         type=str,
         default="probability",
         choices=["probability", "logit"],
+    )
+    parser.add_argument(
+        "--dblock_interblock_transition",
+        type=str,
+        default="euler",
+        choices=[
+            "euler",
+            "direct_denoised",
+            "direct_denoised_plus_noise",
+            "direct_denoised_plus_rescaled_noise",
+        ],
+        help=(
+            "state transition between DBlock denoising steps for the "
+            "classification objective. euler keeps the scheduled diffusion "
+            "Euler update; direct_denoised feeds the predicted clean embedding "
+            "directly to the next block; direct_denoised_plus_noise feeds the "
+            "predicted clean embedding after adding fresh noise at the next "
+            "scheduled sigma; direct_denoised_plus_rescaled_noise reuses one "
+            "Gaussian noise sample per example and rescales it by each next "
+            "scheduled sigma"
+        ),
     )
     parser.add_argument("--cfg_scale", type=float, default=0.0)
     parser.add_argument("--class_dropout_prob", type=float, default=0.0)

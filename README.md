@@ -154,6 +154,27 @@ To replace the linear classifier with a fixed-scale cosine classifier, add:
 --classifier_head_type cosine --cosine_classifier_scale 16.0
 ```
 
+To ablate the inter-block state transition during sequential DBlock denoising,
+replace the default Euler update with a direct handoff of the predicted clean
+embedding:
+
+```bash
+--sequential_denoising_training --dblock_interblock_transition direct_denoised
+```
+
+To test whether re-adding scheduled noise between blocks helps, compare against:
+
+```bash
+--sequential_denoising_training --dblock_interblock_transition direct_denoised_plus_noise
+```
+
+To re-add the same Gaussian noise sample at every step, rescaled by the next
+scheduled sigma, use:
+
+```bash
+--sequential_denoising_training --dblock_interblock_transition direct_denoised_plus_rescaled_noise
+```
+
 For continuous teacher targets, switch the target type and set the output
 dimension:
 
@@ -228,11 +249,16 @@ results/toy_1d_regression/<timestamp>/prediction_uncertainty_by_block.svg
 Use `--observation_noise_std` to add Gaussian observation noise to both train
 and test targets. The old `--target_noise_std` name is kept as an alias.
 Use `--function sin_cos_bifurcation` for a bifurcated regression dataset where
-each example is independently sampled from either `sin(x)` or `cos(x)` with
-equal probability. Prediction plots draw both ground-truth branches.
+training examples include both `sin(x)` and `cos(x)` evaluated at each sampled
+training input location. Test examples are independently sampled from either
+branch with equal probability. Prediction plots draw both ground-truth branches.
 Use `--initial_noise_std 1.0` to make the initial sequential denoising state
 standard normal; when omitted, it uses the previous default
 `sqrt(1 + sigma[0]^2)` scaling.
+Use `--interblock_transition direct_denoised` to feed each block's predicted
+clean latent directly into the next block instead of taking an Euler step. The
+toy script also supports `direct_denoised_plus_noise` and
+`direct_denoised_plus_rescaled_noise` for the matching re-noising ablations.
 Use `--block_objective_pattern first_prediction_then_residual` to train block
 0 with decoded prediction MSE and every later block with residual-next-latent
 loss. Use `--block_objective_pattern alternating_prediction_residual` to train

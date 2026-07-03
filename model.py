@@ -959,6 +959,28 @@ class ViTDBlockModel(ViTModel):
                 f"--dblock_training_objective {self.dblock_training_objective} currently "
                 "requires classification targets"
             )
+        self.dblock_interblock_transition = getattr(
+            self.args, "dblock_interblock_transition", "euler"
+        )
+        if self.dblock_interblock_transition not in [
+            "euler",
+            "direct_denoised",
+            "direct_denoised_plus_noise",
+            "direct_denoised_plus_rescaled_noise",
+        ]:
+            raise ValueError(
+                "--dblock_interblock_transition must be one of "
+                "euler, direct_denoised, direct_denoised_plus_noise, "
+                "direct_denoised_plus_rescaled_noise"
+            )
+        if (
+            self.dblock_interblock_transition != "euler"
+            and self.dblock_training_objective != "classification"
+        ):
+            raise ValueError(
+                "--dblock_interblock_transition direct modes are currently "
+                "supported only with --dblock_training_objective classification"
+            )
         self.trace_block_layers = getattr(self.args, "trace_block_layers", False)
         self.trace_intermediate_predictions = (
             getattr(self.args, "trace_intermediate_predictions", False)
@@ -1036,6 +1058,7 @@ class ViTDBlockModel(ViTModel):
                 "cosine_classifier_scale": self.cosine_classifier_scale,
                 "one_hot_mse_top_k": self.one_hot_mse_top_k,
                 "dblock_training_objective": self.dblock_training_objective,
+                "dblock_interblock_transition": self.dblock_interblock_transition,
                 "dblock_residual_readout_type": self.dblock_residual_readout_type,
                 "dblock_latent_loss_weight": self.dblock_latent_loss_weight,
                 "dblock_prediction_loss_weight": self.dblock_prediction_loss_weight,
@@ -2218,6 +2241,45 @@ class ViTDBlockModel(ViTModel):
         z = z + (next_sigma - sigma)[:, None] * d
         return z.detach()
 
+    def dblock_interblock_update(
+        self,
+        z: torch.Tensor,
+        denoise_output: torch.Tensor | dict[str, torch.Tensor],
+        sigma: torch.Tensor,
+        next_sigma: torch.Tensor,
+        *,
+        detach: bool,
+        base_noise: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.dblock_interblock_transition == "euler":
+            denoised = self.latent_from_denoise_output(denoise_output)
+            d = (z - denoised) / sigma[:, None]
+            updated = z + (next_sigma - sigma)[:, None] * d
+        elif self.dblock_interblock_transition == "direct_denoised":
+            updated = self.latent_from_denoise_output(denoise_output)
+        elif self.dblock_interblock_transition == "direct_denoised_plus_noise":
+            denoised = self.latent_from_denoise_output(denoise_output)
+            updated = denoised + next_sigma[:, None] * self.sample_epsilon_like(
+                denoised
+            )
+        elif (
+            self.dblock_interblock_transition
+            == "direct_denoised_plus_rescaled_noise"
+        ):
+            if base_noise is None:
+                raise ValueError(
+                    "direct_denoised_plus_rescaled_noise requires base_noise"
+                )
+            denoised = self.latent_from_denoise_output(denoise_output)
+            updated = denoised + next_sigma[:, None] * base_noise
+        else:
+            raise ValueError(
+                f"Unsupported dblock_interblock_transition: {self.dblock_interblock_transition}"
+            )
+        if detach:
+            updated = updated.detach()
+        return updated
+
     def aggregate_denoising_losses(
         self,
         losses: list[torch.Tensor],
@@ -2264,12 +2326,12 @@ class ViTDBlockModel(ViTModel):
             labels = labels.view(-1)
         else:
             labels = labels.float().view(-1, self.num_labels)
-        z = self.sample_epsilon(
+        base_noise = self.sample_epsilon(
             (batch_size, hidden_size),
             device=pixel_values.device,
             dtype=pixel_values.dtype,
         )
-        z = z * torch.sqrt(1.0 + self.sigmas[0].to(z) ** 2.0)
+        z = base_noise * torch.sqrt(1.0 + self.sigmas[0].to(base_noise) ** 2.0)
         s_in = pixel_values.new_ones([batch_size])
 
         losses = []
@@ -2299,7 +2361,14 @@ class ViTDBlockModel(ViTModel):
                 continue
 
             next_sigma = self.sigmas[step_index + 1] * s_in
-            z = self.euler_update(z, denoise_output, sigma, next_sigma)
+            z = self.dblock_interblock_update(
+                z,
+                denoise_output,
+                sigma,
+                next_sigma,
+                detach=True,
+                base_noise=base_noise,
+            )
 
         return self.aggregate_denoising_losses(losses, ce_losses, loss_dict, step)
 
@@ -2482,7 +2551,8 @@ class ViTDBlockModel(ViTModel):
         sigma = self.get_sigmas_for_target_block(batch_size, target_block_idx=0).to(
             z_clean
         )
-        z = z_clean + sigma[:, None] * self.sample_epsilon_like(z_clean)
+        base_noise = self.sample_epsilon_like(z_clean)
+        z = z_clean + sigma[:, None] * base_noise
 
         losses = []
         ce_losses = []
@@ -2507,7 +2577,14 @@ class ViTDBlockModel(ViTModel):
 
         if self.sigmas.shape[0] > 1:
             next_sigma = self.sigmas[1] * s_in
-            z = self.euler_update(z, denoise_output, sigma, next_sigma)
+            z = self.dblock_interblock_update(
+                z,
+                denoise_output,
+                sigma,
+                next_sigma,
+                detach=True,
+                base_noise=base_noise,
+            )
 
         for step_index in range(1, self.sigmas.shape[0]):
             sigma = self.sigmas[step_index] * s_in
@@ -2532,7 +2609,14 @@ class ViTDBlockModel(ViTModel):
                 continue
 
             next_sigma = self.sigmas[step_index + 1] * s_in
-            z = self.euler_update(z, denoise_output, sigma, next_sigma)
+            z = self.dblock_interblock_update(
+                z,
+                denoise_output,
+                sigma,
+                next_sigma,
+                detach=True,
+                base_noise=base_noise,
+            )
 
         return self.aggregate_denoising_losses(losses, ce_losses, loss_dict, step)
 
@@ -2660,8 +2744,8 @@ class ViTDBlockModel(ViTModel):
     def diffusion_sample(self, x, return_intermediates: bool = False):
         bsz = x.shape[0]
         hidden_size = self.model.config.hidden_size
-        z = self.sample_epsilon((bsz, hidden_size), device=x.device)
-        z *= torch.sqrt(1.0 + self.sigmas[0] ** 2.0)
+        base_noise = self.sample_epsilon((bsz, hidden_size), device=x.device)
+        z = base_noise * torch.sqrt(1.0 + self.sigmas[0] ** 2.0)
         s_in = x.new_ones([x.shape[0]])
         intermediate_logits = []
         block_indices = []
@@ -2715,13 +2799,14 @@ class ViTDBlockModel(ViTModel):
                 alpha = self.residual_update_alpha(sigma, next_sigma)
                 z = z + alpha[:, None] * residual_pred
             else:
-                denoised = self.latent_from_denoise_output(denoise_output)
-                # to d
-                d = (z - denoised) / sigma[:, None]
-                dt = next_sigma - sigma
-                # euler step
-                euler_step = z + dt[:, None] * d
-                z = euler_step
+                z = self.dblock_interblock_update(
+                    z,
+                    denoise_output,
+                    sigma,
+                    next_sigma,
+                    detach=False,
+                    base_noise=base_noise,
+                )
         min_sigma = self.sigmas[-1].item()
         sigmas = torch.full((x.shape[0],), min_sigma, device=x.device)
         block_idx = self.estimate_target_layer(sigmas)

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import csv
 import datetime as dt
@@ -170,6 +172,8 @@ class ToyConfig:
     shared_denoising_block_ranges: str = ""
     initial_noise_mode: str = "per_example"
     initial_noise_std: float | None = None
+    interblock_transition: str = "euler"
+    noise_correction_mode: str = "none"
     train_encoder_with_prediction_loss_only: bool = False
     observation_noise_std: float = 0.0
     function: str = "sine_poly"
@@ -182,10 +186,19 @@ class ToyConfig:
     no_plots: bool = False
 
 
-def make_dataset(num_examples: int, config: ToyConfig, seed_offset: int):
+def make_dataset(
+    num_examples: int,
+    config: ToyConfig,
+    seed_offset: int,
+    include_all_bifurcation_branches: bool = False,
+):
     generator = torch.Generator().manual_seed(config.seed + seed_offset)
     x = -3.0 + 6.0 * torch.rand(num_examples, 1, generator=generator)
-    y = sample_target_values(x, config, generator)
+    if config.function == "sin_cos_bifurcation" and include_all_bifurcation_branches:
+        y = torch.cat([torch.sin(x), torch.cos(x)], dim=0)
+        x = torch.cat([x, x], dim=0)
+    else:
+        y = sample_target_values(x, config, generator)
     if config.observation_noise_std > 0.0:
         y = y + config.observation_noise_std * torch.randn(
             y.shape,
@@ -285,6 +298,56 @@ class ToyDiffusionBlocks(nn.Module):
     ) -> torch.Tensor:
         d = (z - z_clean_pred) / sigma[:, None]
         return z + (next_sigma - sigma)[:, None] * d
+
+    def corrected_noise_update(
+        self,
+        z_clean_pred: torch.Tensor,
+        z_clean_target: torch.Tensor | None,
+        next_sigma: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.config.noise_correction_mode == "none":
+            raise ValueError("corrected_noise_update called with correction disabled")
+        if self.config.noise_correction_mode != "batch_oracle":
+            raise ValueError(
+                f"Unknown noise_correction_mode: {self.config.noise_correction_mode}"
+            )
+        if z_clean_target is None:
+            raise ValueError(
+                "batch_oracle noise correction requires clean target latents"
+            )
+
+        clean_rmse_scalar = (z_clean_pred - z_clean_target).square().mean().sqrt()
+        clean_rmse = clean_rmse_scalar.expand_as(next_sigma)
+        remaining_variance = next_sigma.square() - clean_rmse_scalar.square()
+        correction_sigma = remaining_variance.clamp_min(0.0).sqrt()
+        noise = torch.randn_like(z_clean_pred)
+        z_next = z_clean_pred + correction_sigma[:, None] * noise
+        return z_next, clean_rmse.detach(), correction_sigma.detach()
+
+    def interblock_update(
+        self,
+        z: torch.Tensor,
+        z_clean_pred: torch.Tensor,
+        sigma: torch.Tensor,
+        next_sigma: torch.Tensor,
+        *,
+        base_noise: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.config.interblock_transition == "euler":
+            return self.euler_update(z, z_clean_pred, sigma, next_sigma)
+        if self.config.interblock_transition == "direct_denoised":
+            return z_clean_pred
+        if self.config.interblock_transition == "direct_denoised_plus_noise":
+            return z_clean_pred + next_sigma[:, None] * torch.randn_like(z_clean_pred)
+        if self.config.interblock_transition == "direct_denoised_plus_rescaled_noise":
+            if base_noise is None:
+                raise ValueError(
+                    "direct_denoised_plus_rescaled_noise requires base_noise"
+                )
+            return z_clean_pred + next_sigma[:, None] * base_noise
+        raise ValueError(
+            f"Unknown interblock_transition: {self.config.interblock_transition}"
+        )
 
     def uses_residual_next_latent_objective(self) -> bool:
         return self.config.training_objective == "residual_next_latent"
@@ -418,20 +481,26 @@ class ToyDiffusionBlocks(nn.Module):
         x: torch.Tensor,
         sigmas: torch.Tensor,
         *,
+        target_y: torch.Tensor | None = None,
         noise: torch.Tensor | None = None,
         prediction_mode: str = "state",
+        return_noise_correction_metrics: bool = False,
     ):
         if prediction_mode not in ["state", "clean_estimate"]:
             raise ValueError(f"Unknown prediction_mode: {prediction_mode}")
         batch_size = x.shape[0]
+        z_clean_target = self.clean_latent(target_y) if target_y is not None else None
         if noise is None:
-            z = self.initial_noise(batch_size, x.device, x.dtype)
+            base_noise = self.initial_noise(batch_size, x.device, x.dtype)
         else:
-            z = noise.to(device=x.device, dtype=x.dtype)
-        z = z * self.initial_noise_scale(sigmas)
+            base_noise = noise.to(device=x.device, dtype=x.dtype)
+        z = base_noise * self.initial_noise_scale(sigmas)
 
         predictions = []
         latents = []
+        correction_clean_rmse = []
+        correction_sigma = []
+        correction_saturated = []
         for block_index in range(self.config.num_blocks):
             block = self.denoising_block(block_index)
             sigma = sigmas[block_index].expand(batch_size)
@@ -461,9 +530,59 @@ class ToyDiffusionBlocks(nn.Module):
             if block_index < len(self.blocks) - 1:
                 if self.block_uses_residual_update(block_index):
                     z = z_next_pred.detach()
+                    clean_rmse = sigma.new_full((batch_size,), float("nan"))
+                    added_sigma = sigma.new_full((batch_size,), float("nan"))
+                    saturated = sigma.new_full((batch_size,), float("nan"))
+                elif self.config.noise_correction_mode != "none":
+                    z, clean_rmse, added_sigma = self.corrected_noise_update(
+                        block_output,
+                        z_clean_target,
+                        next_sigma,
+                    )
+                    z = z.detach()
+                    saturated = (added_sigma <= 0.0).to(dtype=sigma.dtype)
                 else:
-                    z = self.euler_update(z, block_output, sigma, next_sigma).detach()
-        return torch.stack(predictions), torch.stack(latents)
+                    z = self.interblock_update(
+                        z,
+                        block_output,
+                        sigma,
+                        next_sigma,
+                        base_noise=base_noise,
+                    ).detach()
+                    if z_clean_target is None:
+                        clean_rmse = sigma.new_full((batch_size,), float("nan"))
+                    else:
+                        clean_rmse = (
+                            (latent_prediction - z_clean_target)
+                            .square()
+                            .mean(dim=1)
+                            .sqrt()
+                        )
+                    if self.config.interblock_transition == "direct_denoised":
+                        added_sigma = next_sigma.new_zeros(next_sigma.shape)
+                    else:
+                        added_sigma = next_sigma.detach()
+                    saturated = sigma.new_zeros((batch_size,))
+                correction_clean_rmse.append(clean_rmse.detach())
+                correction_sigma.append(added_sigma.detach())
+                correction_saturated.append(saturated.detach())
+        outputs = (torch.stack(predictions), torch.stack(latents))
+        if not return_noise_correction_metrics:
+            return outputs
+        if correction_clean_rmse:
+            metrics = {
+                "clean_rmse": torch.stack(correction_clean_rmse),
+                "added_sigma": torch.stack(correction_sigma),
+                "saturated": torch.stack(correction_saturated),
+            }
+        else:
+            empty = x.new_empty((0, batch_size))
+            metrics = {
+                "clean_rmse": empty,
+                "added_sigma": empty,
+                "saturated": empty,
+            }
+        return (*outputs, metrics)
 
     def oracle_predictions(
         self,
@@ -516,7 +635,7 @@ class ToyDiffusionBlocks(nn.Module):
 
         z_clean = self.clean_latent(y)
         z_clean_target = self.latent_target_for_loss(z_clean)
-        predictions, latents = self.sequential_predictions(x, sigmas)
+        predictions, latents = self.sequential_predictions(x, sigmas, target_y=y)
         mse_losses = F.mse_loss(
             predictions,
             y.unsqueeze(0).expand_as(predictions),
@@ -557,8 +676,8 @@ class ToyDiffusionBlocks(nn.Module):
         batch_size = x.shape[0]
         z_clean = self.clean_latent(y)
         z_clean_target = self.latent_target_for_loss(z_clean)
-        z = self.initial_noise(batch_size, x.device, x.dtype)
-        z = z * self.initial_noise_scale(sigmas)
+        base_noise = self.initial_noise(batch_size, x.device, x.dtype)
+        z = base_noise * self.initial_noise_scale(sigmas)
 
         predictions = []
         mse_losses = []
@@ -602,12 +721,21 @@ class ToyDiffusionBlocks(nn.Module):
                 residual_loss = prediction_loss.new_zeros(())
                 per_block_loss = prediction_loss
                 if block_index < len(self.blocks) - 1:
-                    z = self.euler_update(
-                        z_input,
-                        z_clean_pred,
-                        sigma,
-                        next_sigma,
-                    ).detach()
+                    if self.config.noise_correction_mode == "none":
+                        z = self.interblock_update(
+                            z_input,
+                            z_clean_pred,
+                            sigma,
+                            next_sigma,
+                            base_noise=base_noise,
+                        ).detach()
+                    else:
+                        z, _, _ = self.corrected_noise_update(
+                            z_clean_pred,
+                            z_clean_target,
+                            next_sigma,
+                        )
+                        z = z.detach()
 
             predictions.append(y_pred)
             mse_losses.append(prediction_loss)
@@ -903,13 +1031,31 @@ def evaluate_model(
     latent_count = 0
     final_disagreement_sse = torch.zeros(model.config.num_blocks, device=sigmas.device)
     previous_change_sse = torch.zeros(model.config.num_blocks, device=sigmas.device)
+    correction_clean_rmse_sum = torch.zeros(
+        model.config.num_blocks,
+        device=sigmas.device,
+    )
+    correction_added_sigma_sum = torch.zeros(
+        model.config.num_blocks,
+        device=sigmas.device,
+    )
+    correction_saturated_sum = torch.zeros(
+        model.config.num_blocks,
+        device=sigmas.device,
+    )
+    correction_count = torch.zeros(model.config.num_blocks, device=sigmas.device)
 
     with torch.no_grad():
         for x, y in dataloader:
             x = x.to(sigmas.device)
             y = y.to(sigmas.device)
             z_clean = model.clean_latent(y)
-            seq_preds, seq_latents = model.sequential_predictions(x, sigmas)
+            seq_preds, seq_latents, correction_metrics = model.sequential_predictions(
+                x,
+                sigmas,
+                target_y=y,
+                return_noise_correction_metrics=True,
+            )
             oracle_preds, oracle_latents = model.oracle_predictions(x, y, sigmas)
             target = y.unsqueeze(0).expand_as(seq_preds)
             latent_target = z_clean.unsqueeze(0).expand_as(seq_latents)
@@ -926,11 +1072,41 @@ def evaluate_model(
             changes = torch.zeros_like(seq_preds)
             changes[1:] = seq_preds[1:] - seq_preds[:-1]
             previous_change_sse += changes.square().sum(dim=(1, 2))
+            if correction_metrics["clean_rmse"].numel() > 0:
+                clean_rmse = correction_metrics["clean_rmse"]
+                added_sigma = correction_metrics["added_sigma"]
+                saturated = correction_metrics["saturated"]
+                finite = torch.isfinite(clean_rmse)
+                transition_count = finite.sum(dim=1).to(dtype=sigmas.dtype)
+                correction_clean_rmse_sum[: clean_rmse.shape[0]] += (
+                    clean_rmse.nan_to_num(nan=0.0) * finite
+                ).sum(dim=1)
+                correction_added_sigma_sum[: added_sigma.shape[0]] += (
+                    added_sigma.nan_to_num(nan=0.0) * finite
+                ).sum(dim=1)
+                correction_saturated_sum[: saturated.shape[0]] += (
+                    saturated.nan_to_num(nan=0.0) * finite
+                ).sum(dim=1)
+                correction_count[: clean_rmse.shape[0]] += transition_count
             count += y.numel()
             latent_count += z_clean.numel()
 
     rows = []
     for block_index in range(model.config.num_blocks):
+        if correction_count[block_index] > 0:
+            correction_clean_rmse = (
+                correction_clean_rmse_sum[block_index] / correction_count[block_index]
+            )
+            correction_added_sigma = (
+                correction_added_sigma_sum[block_index] / correction_count[block_index]
+            )
+            correction_saturated_fraction = (
+                correction_saturated_sum[block_index] / correction_count[block_index]
+            )
+        else:
+            correction_clean_rmse = sigmas.new_tensor(float("nan"))
+            correction_added_sigma = sigmas.new_tensor(float("nan"))
+            correction_saturated_fraction = sigmas.new_tensor(float("nan"))
         rows.append(
             {
                 "split": split,
@@ -972,6 +1148,15 @@ def evaluate_model(
                 ),
                 "changed_from_previous_mse": float(
                     (previous_change_sse[block_index] / count).detach().cpu()
+                ),
+                "noise_correction_clean_rmse": float(
+                    correction_clean_rmse.detach().cpu()
+                ),
+                "noise_correction_added_sigma": float(
+                    correction_added_sigma.detach().cpu()
+                ),
+                "noise_correction_saturated_fraction": float(
+                    correction_saturated_fraction.detach().cpu()
                 ),
             }
         )
@@ -1018,6 +1203,7 @@ def evaluate_prediction_curves(
         predictions, _ = model.sequential_predictions(
             x,
             sigmas,
+            target_y=target,
             noise=noise,
             prediction_mode="clean_estimate",
         )
@@ -1072,6 +1258,7 @@ def evaluate_prediction_uncertainty(
             predictions, _ = model.sequential_predictions(
                 x,
                 sigmas,
+                target_y=target,
                 noise=noise,
                 prediction_mode="clean_estimate",
             )
@@ -1133,6 +1320,7 @@ def evaluate_prediction_uncertainty_samples(
             predictions, _ = model.sequential_predictions(
                 x,
                 sigmas,
+                target_y=target_function(x, config.function),
                 noise=noise,
                 prediction_mode="clean_estimate",
             )
@@ -2810,7 +2998,8 @@ def write_prediction_plot(
     model.eval()
     x = torch.linspace(-3.2, 3.2, 512, device=sigmas.device).view(-1, 1)
     with torch.no_grad():
-        seq_preds, _ = model.sequential_predictions(x, sigmas)
+        target = target_function(x, config.function)
+        seq_preds, _ = model.sequential_predictions(x, sigmas, target_y=target)
 
     fig, ax = plt.subplots(figsize=(7, 4.5))
     train_x, train_y = train_data.tensors
@@ -2871,7 +3060,12 @@ def train(config: ToyConfig):
     else:
         device = torch.device(config.device)
 
-    train_data = make_dataset(config.num_train, config, seed_offset=0)
+    train_data = make_dataset(
+        config.num_train,
+        config,
+        seed_offset=0,
+        include_all_bifurcation_branches=True,
+    )
     test_data = make_dataset(config.num_test, config, seed_offset=10_000)
     train_loader = DataLoader(
         train_data,
@@ -3361,6 +3555,37 @@ def parse_args() -> ToyConfig:
         ),
     )
     parser.add_argument(
+        "--interblock_transition",
+        type=str,
+        default=ToyConfig.interblock_transition,
+        choices=[
+            "euler",
+            "direct_denoised",
+            "direct_denoised_plus_noise",
+            "direct_denoised_plus_rescaled_noise",
+        ],
+        help=(
+            "state transition for prediction-objective toy DBlock steps. "
+            "euler keeps the scheduled diffusion update; direct_denoised feeds "
+            "the predicted clean latent directly to the next block; "
+            "direct_denoised_plus_noise re-noises it with fresh noise at the "
+            "next sigma; direct_denoised_plus_rescaled_noise reuses the same "
+            "initial noise direction and rescales it by the next sigma"
+        ),
+    )
+    parser.add_argument(
+        "--noise_correction_mode",
+        type=str,
+        default=ToyConfig.noise_correction_mode,
+        choices=["none", "batch_oracle"],
+        help=(
+            "inter-block noise correction mode. none uses the scheduled Euler "
+            "transition. batch_oracle estimates each block's clean-latent RMSE "
+            "against the current batch targets and re-noises the clean estimate "
+            "with sqrt(max(next_sigma^2 - rmse^2, 0))"
+        ),
+    )
+    parser.add_argument(
         "--train_encoder_with_prediction_loss_only",
         action="store_true",
         help=(
@@ -3436,6 +3661,14 @@ def parse_args() -> ToyConfig:
         raise ValueError("--observation_noise_std must be non-negative")
     if config.initial_noise_std is not None and config.initial_noise_std < 0.0:
         raise ValueError("--initial_noise_std must be non-negative when set")
+    if (
+        config.interblock_transition != "euler"
+        and config.noise_correction_mode != "none"
+    ):
+        raise ValueError(
+            "--interblock_transition direct modes require "
+            "--noise_correction_mode none"
+        )
     if config.prediction_loss_weight < 0.0:
         raise ValueError("--prediction_loss_weight must be non-negative")
     if config.latent_loss_weight < 0.0:
