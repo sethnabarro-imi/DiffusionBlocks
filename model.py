@@ -910,6 +910,26 @@ class ViTDBlockModel(ViTModel):
         self.dblock_training_objective = getattr(
             self.args, "dblock_training_objective", "classification"
         )
+        self.dblock_denoising_space = getattr(
+            self.args, "dblock_denoising_space", "embedding"
+        )
+        if self.dblock_denoising_space not in ["embedding", "logits"]:
+            raise ValueError(
+                "--dblock_denoising_space must be one of embedding or logits"
+            )
+        if (
+            self.dblock_denoising_space == "logits"
+            and self.task_type != "classification"
+        ):
+            raise ValueError("--dblock_denoising_space logits requires classification")
+        if (
+            self.dblock_denoising_space == "logits"
+            and self.dblock_training_objective != "classification"
+        ):
+            raise ValueError(
+                "--dblock_denoising_space logits is currently supported only with "
+                "--dblock_training_objective classification"
+            )
         self.dblock_residual_readout_type = getattr(
             self.args, "dblock_residual_readout_type", "classifier"
         )
@@ -1058,6 +1078,7 @@ class ViTDBlockModel(ViTModel):
                 "cosine_classifier_scale": self.cosine_classifier_scale,
                 "one_hot_mse_top_k": self.one_hot_mse_top_k,
                 "dblock_training_objective": self.dblock_training_objective,
+                "dblock_denoising_space": self.dblock_denoising_space,
                 "dblock_interblock_transition": self.dblock_interblock_transition,
                 "dblock_residual_readout_type": self.dblock_residual_readout_type,
                 "dblock_latent_loss_weight": self.dblock_latent_loss_weight,
@@ -1098,6 +1119,11 @@ class ViTDBlockModel(ViTModel):
         )
         if self.task_type == "regression":
             self.regression_target_encoder = torch.nn.Linear(
+                self.num_labels,
+                self.model.config.hidden_size,
+            )
+        if self.dblock_denoising_space == "logits":
+            self.logit_state_input_projection = torch.nn.Linear(
                 self.num_labels,
                 self.model.config.hidden_size,
             )
@@ -1169,11 +1195,30 @@ class ViTDBlockModel(ViTModel):
             )
         return self.normalize_embeddings(embeds)
 
+    def uses_logit_denoising_space(self) -> bool:
+        return self.dblock_denoising_space == "logits"
+
+    def denoising_state_dim(self) -> int:
+        if self.uses_logit_denoising_space():
+            return self.num_labels
+        return self.model.config.hidden_size
+
+    def labels_to_logit_state(self, labels: torch.Tensor) -> torch.Tensor:
+        labels = labels.view(-1)
+        return F.one_hot(labels, num_classes=self.num_labels).float()
+
     def get_target_latents(self, targets: torch.Tensor) -> torch.Tensor:
         if self.task_type == "classification":
+            if self.uses_logit_denoising_space():
+                return self.labels_to_logit_state(targets)
             return self.get_embeds(targets, is_input=True)
         targets = targets.float().view(-1, self.num_labels)
         return self.normalize_embeddings(self.regression_target_encoder(targets))
+
+    def denoising_state_to_block_input(self, state: torch.Tensor) -> torch.Tensor:
+        if self.uses_logit_denoising_space():
+            return self.logit_state_input_projection(state)
+        return state
 
     def get_sigmas(self, n_samples: int, p_mean: float = -1.2, p_std: float = 1.2):
         block_idx = random.choices(range(self.args.num_blocks), k=1)[0]
@@ -1347,6 +1392,7 @@ class ViTDBlockModel(ViTModel):
             x = torch.cat([uncond_x, x])
             zt = torch.cat([zt] * 2)
             sigma = torch.cat([sigma] * 2)
+        zt_block_input = self.denoising_state_to_block_input(zt)
 
         c_skip = self.sigma_data**2 / (sigma**2 + self.sigma_data**2)
         c_out = sigma * self.sigma_data / (sigma**2 + self.sigma_data**2) ** 0.5
@@ -1357,15 +1403,20 @@ class ViTDBlockModel(ViTModel):
         outputs = self.model.forward_block(
             layer_indices=layer_indices,
             pixel_values=x,
-            noisy_embeds=zt * c_in[:, None],
+            noisy_embeds=zt_block_input * c_in[:, None],
             timesteps=c_noise,
             output_hidden_states=return_layer_logits,
         )
         hidden_states = outputs.last_hidden_state
         conditioning = outputs.conditioning
-        model_out = hidden_states * c_out[:, None] + zt * c_skip[:, None]
+        model_out = hidden_states * c_out[:, None] + zt_block_input * c_skip[:, None]
         latent_delta = None
-        if self.uses_residual_latent_objective():
+        if self.uses_logit_denoising_space():
+            logits = self.model.forward_output_embeddings(
+                model_out.unsqueeze(1), conditioning
+            )
+            logits = self.apply_classifier_free_guidance(logits)
+        elif self.uses_residual_latent_objective():
             latent_delta = self.model.forward_latent_delta(
                 hidden_states.unsqueeze(1), conditioning
             )
@@ -1380,6 +1431,8 @@ class ViTDBlockModel(ViTModel):
         if self.task_type == "regression":
             model_out = self.apply_classifier_free_guidance(model_out)
         if not return_layer_logits:
+            if self.uses_logit_denoising_space():
+                return {"logits": logits, "latent": logits}
             if self.task_type == "regression" or self.uses_residual_latent_objective():
                 if latent_delta is not None:
                     return {
@@ -1403,9 +1456,19 @@ class ViTDBlockModel(ViTModel):
                 layer_model_out = zt_for_update + layer_delta
                 layer_logit = self.logits_from_latent(layer_model_out)
                 layer_latent_deltas.append(layer_delta)
+            elif self.uses_logit_denoising_space():
+                layer_model_out = (
+                    layer_hidden_states * c_out[:, None]
+                    + zt_block_input * c_skip[:, None]
+                )
+                layer_logit = self.model.forward_output_embeddings(
+                    layer_model_out.unsqueeze(1), conditioning
+                )
+                layer_logit = self.apply_classifier_free_guidance(layer_logit)
             else:
                 layer_model_out = (
-                    layer_hidden_states * c_out[:, None] + zt * c_skip[:, None]
+                    layer_hidden_states * c_out[:, None]
+                    + zt_block_input * c_skip[:, None]
                 )
                 layer_logit = self.model.forward_output_embeddings(
                     layer_model_out.unsqueeze(1), conditioning
@@ -1426,6 +1489,9 @@ class ViTDBlockModel(ViTModel):
         if self.task_type == "regression":
             result["latent"] = model_out
             result["layer_latents"] = torch.stack(layer_latents)
+        if self.uses_logit_denoising_space():
+            result["latent"] = logits
+            result["layer_latents"] = torch.stack(layer_logits)
         if self.uses_residual_latent_objective():
             result["latent"] = model_out
             result["latent_delta"] = latent_delta
@@ -2165,6 +2231,8 @@ class ViTDBlockModel(ViTModel):
             if not isinstance(denoise_output, dict):
                 raise ValueError("Residual denoise output must include a latent")
             return denoise_output["latent"]
+        if self.uses_logit_denoising_space():
+            return self.prediction_from_denoise_output(denoise_output)
         return self.denoised_embedding_from_logits(
             self.prediction_from_denoise_output(denoise_output)
         )
@@ -2321,13 +2389,13 @@ class ViTDBlockModel(ViTModel):
             )
 
         batch_size = pixel_values.shape[0]
-        hidden_size = self.model.config.hidden_size
+        state_dim = self.denoising_state_dim()
         if self.task_type == "classification":
             labels = labels.view(-1)
         else:
             labels = labels.float().view(-1, self.num_labels)
         base_noise = self.sample_epsilon(
-            (batch_size, hidden_size),
+            (batch_size, state_dim),
             device=pixel_values.device,
             dtype=pixel_values.dtype,
         )
@@ -2743,8 +2811,8 @@ class ViTDBlockModel(ViTModel):
 
     def diffusion_sample(self, x, return_intermediates: bool = False):
         bsz = x.shape[0]
-        hidden_size = self.model.config.hidden_size
-        base_noise = self.sample_epsilon((bsz, hidden_size), device=x.device)
+        state_dim = self.denoising_state_dim()
+        base_noise = self.sample_epsilon((bsz, state_dim), device=x.device)
         z = base_noise * torch.sqrt(1.0 + self.sigmas[0] ** 2.0)
         s_in = x.new_ones([x.shape[0]])
         intermediate_logits = []

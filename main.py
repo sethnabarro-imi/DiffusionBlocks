@@ -217,6 +217,7 @@ def write_eval_results(args, data, logdir, ckpt_path, split_results):
         "dblock_interblock_transition": getattr(
             args, "dblock_interblock_transition", "euler"
         ),
+        "dblock_denoising_space": getattr(args, "dblock_denoising_space", "embedding"),
         "sequential_denoising_training": getattr(
             args, "sequential_denoising_training", False
         ),
@@ -380,6 +381,7 @@ def write_blockwise_training_eval_results(
         "dblock_interblock_transition": getattr(
             args, "dblock_interblock_transition", "euler"
         ),
+        "dblock_denoising_space": getattr(args, "dblock_denoising_space", "embedding"),
         "sequential_denoising_training": getattr(
             args, "sequential_denoising_training", False
         ),
@@ -530,6 +532,8 @@ def validate_args(args):
         raise ValueError("--sequential_denoising_training is only supported for dblock")
     if args.dblock_interblock_transition != "euler" and args.model_type != "dblock":
         raise ValueError("--dblock_interblock_transition is only supported for dblock")
+    if args.dblock_denoising_space != "embedding" and args.model_type != "dblock":
+        raise ValueError("--dblock_denoising_space is only supported for dblock")
     if args.hybrid_block0_independent_training and args.model_type != "dblock":
         raise ValueError(
             "--hybrid_block0_independent_training is only supported for dblock"
@@ -594,6 +598,14 @@ def validate_args(args):
             "--dblock_interblock_transition direct modes are currently supported "
             "only with --dblock_training_objective classification"
         )
+    if args.dblock_denoising_space == "logits":
+        if args.task_type != "classification":
+            raise ValueError("--dblock_denoising_space logits requires classification")
+        if args.dblock_training_objective != "classification":
+            raise ValueError(
+                "--dblock_denoising_space logits is currently supported only with "
+                "--dblock_training_objective classification"
+            )
     if args.data_name == "synthetic-teacher":
         if args.synthetic_num_train < 1:
             raise ValueError("--synthetic_num_train must be at least 1")
@@ -866,6 +878,18 @@ if __name__ == "__main__":
             "scheduled sigma; direct_denoised_plus_rescaled_noise reuses one "
             "Gaussian noise sample per example and rescales it by each next "
             "scheduled sigma"
+        ),
+    )
+    parser.add_argument(
+        "--dblock_denoising_space",
+        type=str,
+        default="embedding",
+        choices=["embedding", "logits"],
+        help=(
+            "state space for classification DBlock denoising. embedding keeps "
+            "the original noised label-embedding state; logits noises a "
+            "num-label class-vector state directly and projects it into the "
+            "ViT block input"
         ),
     )
     parser.add_argument("--cfg_scale", type=float, default=0.0)

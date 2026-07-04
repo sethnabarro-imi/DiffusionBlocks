@@ -148,6 +148,19 @@ To use alternatives that avoid unbounded cross-entropy margins:
 
 The hinge losses use `--multiclass_hinge_margin 1.0` by default.
 
+To run the DBlock diffusion state directly in class-vector/logit space instead
+of label-embedding space, add:
+
+```bash
+--dblock_denoising_space logits --classification_loss_type one_hot_mse
+```
+
+This makes the noised state `num_labels`-dimensional. For CIFAR-100, each block
+denoises a 100D class vector and a learned projection maps that noisy vector
+into the ViT block input. `one_hot_mse` is the most direct finite clean-target
+objective for this mode; cross-entropy is still accepted, but its clean logit
+target is only implicit through the label.
+
 To replace the linear classifier with a fixed-scale cosine classifier, add:
 
 ```bash
