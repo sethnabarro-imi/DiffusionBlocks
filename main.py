@@ -599,7 +599,7 @@ def validate_args(args):
             "only with --dblock_training_objective classification"
         )
     if args.dblock_denoising_space == "logits":
-        if args.task_type != "classification":
+        if getattr(args, "task_type", "classification") != "classification":
             raise ValueError("--dblock_denoising_space logits requires classification")
         if args.dblock_training_objective != "classification":
             raise ValueError(
