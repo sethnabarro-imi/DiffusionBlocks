@@ -592,11 +592,13 @@ def validate_args(args):
                 )
     if (
         args.dblock_interblock_transition != "euler"
-        and args.dblock_training_objective != "classification"
+        and args.dblock_training_objective
+        not in ["classification", "residual_to_clean"]
     ):
         raise ValueError(
             "--dblock_interblock_transition direct modes are currently supported "
-            "only with --dblock_training_objective classification"
+            "only with --dblock_training_objective classification or "
+            "residual_to_clean"
         )
     if args.dblock_denoising_space == "logits":
         if getattr(args, "task_type", "classification") != "classification":

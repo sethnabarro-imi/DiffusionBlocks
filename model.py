@@ -995,11 +995,13 @@ class ViTDBlockModel(ViTModel):
             )
         if (
             self.dblock_interblock_transition != "euler"
-            and self.dblock_training_objective != "classification"
+            and self.dblock_training_objective
+            not in ["classification", "residual_to_clean"]
         ):
             raise ValueError(
                 "--dblock_interblock_transition direct modes are currently "
-                "supported only with --dblock_training_objective classification"
+                "supported only with --dblock_training_objective classification "
+                "or residual_to_clean"
             )
         self.trace_block_layers = getattr(self.args, "trace_block_layers", False)
         self.trace_intermediate_predictions = (
@@ -2532,12 +2534,12 @@ class ViTDBlockModel(ViTModel):
         hidden_size = self.model.config.hidden_size
         labels = labels.view(-1)
         z_clean = self.get_target_latents(labels)
-        z = self.sample_epsilon(
+        base_noise = self.sample_epsilon(
             (batch_size, hidden_size),
             device=pixel_values.device,
             dtype=pixel_values.dtype,
         )
-        z = z * torch.sqrt(1.0 + self.sigmas[0].to(z) ** 2.0)
+        z = base_noise * torch.sqrt(1.0 + self.sigmas[0].to(base_noise) ** 2.0)
         s_in = pixel_values.new_ones([batch_size])
 
         losses = []
@@ -2597,8 +2599,14 @@ class ViTDBlockModel(ViTModel):
             loss_dict[f"{step}/ce_loss_{block_idx}"] = ce_loss
             loss_dict[f"{step}/weighted_loss_{block_idx}"] = weighted_loss
 
-            alpha = self.residual_update_alpha(sigma, next_sigma)
-            z = z_input + alpha[:, None] * residual_pred.detach()
+            z = self.dblock_interblock_update(
+                z_input,
+                denoise_output,
+                sigma,
+                next_sigma,
+                detach=True,
+                base_noise=base_noise,
+            )
 
         return self.aggregate_denoising_losses(losses, ce_losses, loss_dict, step)
 
@@ -2863,9 +2871,14 @@ class ViTDBlockModel(ViTModel):
             if self.uses_residual_next_latent_objective():
                 z = self.latent_from_denoise_output(denoise_output)
             elif self.uses_residual_to_clean_objective():
-                residual_pred = self.latent_delta_from_denoise_output(denoise_output)
-                alpha = self.residual_update_alpha(sigma, next_sigma)
-                z = z + alpha[:, None] * residual_pred
+                z = self.dblock_interblock_update(
+                    z,
+                    denoise_output,
+                    sigma,
+                    next_sigma,
+                    detach=False,
+                    base_noise=base_noise,
+                )
             else:
                 z = self.dblock_interblock_update(
                     z,
