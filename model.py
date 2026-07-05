@@ -605,13 +605,17 @@ class ViTModel(L.LightningModule):
         self.save_hyperparameters(args)
 
     def architecture_kwargs(self) -> dict:
-        return {
+        kwargs = {
             "num_hidden_layers": self.args.num_hidden_layers,
             "attention_probs_dropout_prob": self.args.attention_probs_dropout_prob,
             "hidden_dropout_prob": self.args.hidden_dropout_prob,
             "classifier_head_type": self.classifier_head_type,
             "cosine_classifier_scale": self.cosine_classifier_scale,
         }
+        hidden_size = getattr(self.args, "hidden_size", None)
+        if hidden_size is not None:
+            kwargs["hidden_size"] = hidden_size
+        return kwargs
 
     def build_eval_metrics(self, prefix: str):
         if self.task_type == "regression":

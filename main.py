@@ -498,6 +498,8 @@ def run_train_test_evaluation(trainer, model, data, ckpt_path, args, logdir):
 def validate_args(args):
     if args.num_hidden_layers < 1:
         raise ValueError("--num_hidden_layers must be at least 1")
+    if getattr(args, "hidden_size", None) is not None and args.hidden_size < 1:
+        raise ValueError("--hidden_size must be positive")
     for key in ["attention_probs_dropout_prob", "hidden_dropout_prob"]:
         value = getattr(args, key)
         if value < 0.0 or value > 1.0:
@@ -748,6 +750,15 @@ if __name__ == "__main__":
         type=int,
         default=12,
         help="number of transformer layers in the ViT backbone",
+    )
+    parser.add_argument(
+        "--hidden_size",
+        type=int,
+        default=None,
+        help=(
+            "hidden/embedding dimension for the ViT backbone; unset keeps the "
+            "dataset default, e.g. 128 for CIFAR"
+        ),
     )
     parser.add_argument(
         "--attention_probs_dropout_prob",
