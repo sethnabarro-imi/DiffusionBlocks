@@ -8,7 +8,14 @@ import torchmetrics
 from transformers import get_scheduler
 
 from vit import load_vit
-from dblock_modules import get_block_sigmas, get_discrete_sigmas
+from dblock_modules import (
+    alpha_bar_from_sigma,
+    cosine_alpha_bar_from_progress,
+    cosine_progress_from_alpha_bar,
+    get_block_sigmas,
+    get_discrete_sigmas,
+    sigma_from_alpha_bar,
+)
 
 
 def parse_shared_denoising_block_ranges(
@@ -1023,7 +1030,25 @@ class ViTDBlockModel(ViTModel):
             raise ValueError("--epsilon_seed must be non-negative")
         if self.trace_prediction_examples < 0:
             raise ValueError("--trace_prediction_examples must be non-negative")
-        self.block_sigmas = get_block_sigmas(num_layers=self.args.num_blocks)
+        self.dblock_noise_schedule = getattr(self.args, "dblock_noise_schedule", "edm")
+        self.dblock_sigma_min = getattr(self.args, "dblock_sigma_min", 0.002)
+        self.dblock_sigma_max = getattr(self.args, "dblock_sigma_max", 80.0)
+        if self.dblock_noise_schedule not in ["edm", "linear", "cosine"]:
+            raise ValueError(
+                "--dblock_noise_schedule must be one of edm, linear, or cosine"
+            )
+        if self.dblock_sigma_min <= 0.0:
+            raise ValueError("--dblock_sigma_min must be positive")
+        if self.dblock_sigma_max <= self.dblock_sigma_min:
+            raise ValueError(
+                "--dblock_sigma_max must be greater than --dblock_sigma_min"
+            )
+        self.block_sigmas = get_block_sigmas(
+            num_layers=self.args.num_blocks,
+            sigma_min=self.dblock_sigma_min,
+            sigma_max=self.dblock_sigma_max,
+            schedule=self.dblock_noise_schedule,
+        )
         self.layer_assignment = None
         intermediate_metric_cls = (
             DBlockRegressionPredictionMetric
@@ -1066,14 +1091,21 @@ class ViTDBlockModel(ViTModel):
         }
         self.register_buffer(
             "sigmas",
-            get_discrete_sigmas(num_steps=self.num_inference_steps, dblock=True).to(
-                self.device
-            ),
+            get_discrete_sigmas(
+                num_steps=self.num_inference_steps,
+                sigma_min=self.dblock_sigma_min,
+                sigma_max=self.dblock_sigma_max,
+                dblock=True,
+                schedule=self.dblock_noise_schedule,
+            ).to(self.device),
             persistent=False,
         )
         self.save_hyperparameters(
             {
                 "gamma": self.gamma,
+                "dblock_noise_schedule": self.dblock_noise_schedule,
+                "dblock_sigma_min": self.dblock_sigma_min,
+                "dblock_sigma_max": self.dblock_sigma_max,
                 "num_inference_steps": self.num_inference_steps,
                 "num_prediction_samples": self.num_prediction_samples,
                 "prediction_average": self.prediction_average,
@@ -1277,6 +1309,35 @@ class ViTDBlockModel(ViTModel):
             sigma_max_block = np.exp(log_sigma_max + self.gamma * log_range)
             sigma_min_block = max(sigma_min_block, self.block_sigmas[0])
             sigma_max_block = min(sigma_max_block, self.block_sigmas[-1])
+
+        if self.dblock_noise_schedule == "linear":
+            alpha_min_block = alpha_bar_from_sigma(sigma_max_block)
+            alpha_max_block = alpha_bar_from_sigma(sigma_min_block)
+            alpha_bar = np.random.uniform(alpha_min_block, alpha_max_block, n_samples)
+            sigma = sigma_from_alpha_bar(alpha_bar)
+            return torch.from_numpy(sigma)
+
+        if self.dblock_noise_schedule == "cosine":
+            alpha_min_block = alpha_bar_from_sigma(sigma_max_block)
+            alpha_max_block = alpha_bar_from_sigma(sigma_min_block)
+            progress_min = cosine_progress_from_alpha_bar(
+                alpha_max_block,
+                sigma_min=self.dblock_sigma_min,
+                sigma_max=self.dblock_sigma_max,
+            )
+            progress_max = cosine_progress_from_alpha_bar(
+                alpha_min_block,
+                sigma_min=self.dblock_sigma_min,
+                sigma_max=self.dblock_sigma_max,
+            )
+            progress = np.random.uniform(progress_min, progress_max, n_samples)
+            alpha_bar = cosine_alpha_bar_from_progress(
+                progress,
+                sigma_min=self.dblock_sigma_min,
+                sigma_max=self.dblock_sigma_max,
+            )
+            sigma = sigma_from_alpha_bar(alpha_bar)
+            return torch.from_numpy(sigma)
 
         cdf_min_block = norm.cdf((np.log(sigma_min_block) - p_mean) / p_std)
         cdf_max_block = norm.cdf((np.log(sigma_max_block) - p_mean) / p_std)

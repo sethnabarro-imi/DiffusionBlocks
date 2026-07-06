@@ -214,6 +214,9 @@ def write_eval_results(args, data, logdir, ckpt_path, split_results):
         "one_hot_mse_top_k": getattr(args, "one_hot_mse_top_k", None),
         "num_prediction_samples": args.num_prediction_samples,
         "prediction_average": args.prediction_average,
+        "dblock_noise_schedule": getattr(args, "dblock_noise_schedule", "edm"),
+        "dblock_sigma_min": getattr(args, "dblock_sigma_min", 0.002),
+        "dblock_sigma_max": getattr(args, "dblock_sigma_max", 80.0),
         "dblock_interblock_transition": getattr(
             args, "dblock_interblock_transition", "euler"
         ),
@@ -378,6 +381,9 @@ def write_blockwise_training_eval_results(
         "one_hot_mse_top_k": getattr(args, "one_hot_mse_top_k", None),
         "num_prediction_samples": args.num_prediction_samples,
         "prediction_average": args.prediction_average,
+        "dblock_noise_schedule": getattr(args, "dblock_noise_schedule", "edm"),
+        "dblock_sigma_min": getattr(args, "dblock_sigma_min", 0.002),
+        "dblock_sigma_max": getattr(args, "dblock_sigma_max", 80.0),
         "dblock_interblock_transition": getattr(
             args, "dblock_interblock_transition", "euler"
         ),
@@ -534,6 +540,16 @@ def validate_args(args):
         raise ValueError("--sequential_denoising_training is only supported for dblock")
     if args.dblock_interblock_transition != "euler" and args.model_type != "dblock":
         raise ValueError("--dblock_interblock_transition is only supported for dblock")
+    if args.dblock_noise_schedule != "edm" and args.model_type != "dblock":
+        raise ValueError("--dblock_noise_schedule is only supported for dblock")
+    if args.dblock_sigma_min != 0.002 and args.model_type != "dblock":
+        raise ValueError("--dblock_sigma_min is only supported for dblock")
+    if args.dblock_sigma_max != 80.0 and args.model_type != "dblock":
+        raise ValueError("--dblock_sigma_max is only supported for dblock")
+    if args.dblock_sigma_min <= 0.0:
+        raise ValueError("--dblock_sigma_min must be positive")
+    if args.dblock_sigma_max <= args.dblock_sigma_min:
+        raise ValueError("--dblock_sigma_max must be greater than --dblock_sigma_min")
     if args.dblock_denoising_space != "embedding" and args.model_type != "dblock":
         raise ValueError("--dblock_denoising_space is only supported for dblock")
     if args.hybrid_block0_independent_training and args.model_type != "dblock":
@@ -864,6 +880,30 @@ if __name__ == "__main__":
     # dblock
     parser.add_argument("--num_blocks", type=int, default=3)
     parser.add_argument("--gamma", type=float, default=0.05)
+    parser.add_argument(
+        "--dblock_noise_schedule",
+        type=str,
+        default="edm",
+        choices=["edm", "linear", "cosine"],
+        help=(
+            "noise schedule for DBlock training intervals and inference steps. "
+            "edm keeps the previous log-normal EDM-style schedule; linear uses "
+            "a linear alpha_bar schedule; cosine uses a NoProp-style cosine "
+            "alpha_bar schedule"
+        ),
+    )
+    parser.add_argument(
+        "--dblock_sigma_min",
+        type=float,
+        default=0.002,
+        help="minimum DBlock sigma for all noise schedules",
+    )
+    parser.add_argument(
+        "--dblock_sigma_max",
+        type=float,
+        default=80.0,
+        help="maximum DBlock sigma for all noise schedules",
+    )
     parser.add_argument("--num_inference_steps", type=int, default=None)
     parser.add_argument("--num_prediction_samples", type=int, default=1)
     parser.add_argument(

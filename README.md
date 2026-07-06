@@ -167,6 +167,18 @@ To replace the linear classifier with a fixed-scale cosine classifier, add:
 --classifier_head_type cosine --cosine_classifier_scale 16.0
 ```
 
+To train CIFAR-100 DBlock runs with alternative noise schedules, add one of:
+
+```bash
+--dblock_noise_schedule linear
+--dblock_noise_schedule cosine
+```
+
+`linear` uses a linear alpha-bar schedule. `cosine` uses a NoProp-style cosine
+alpha-bar schedule. Both schedules use `--dblock_sigma_min 0.002` and
+`--dblock_sigma_max 80.0` by default; omit the flag to keep the original
+EDM/log-normal schedule.
+
 To ablate the inter-block state transition during sequential DBlock denoising,
 replace the default Euler update with a direct handoff of the predicted clean
 embedding:
